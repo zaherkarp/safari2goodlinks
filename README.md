@@ -4,6 +4,8 @@ Save every tab in a Safari Tab Group — with smart auto-tagging — to [GoodLin
 
 No AI, no network calls, no dependencies beyond macOS + Python 3 (pre-installed on macOS).
 
+To sort tabs from every window, every Tab Group and your iPhone/iPad into read-later, notes and bookmarks, see [Triage](#triage-tabs-to-read--note--bookmark).
+
 ## How it works
 
 ```
@@ -185,6 +187,103 @@ In `active` mode, `--group` is not required. The script reads whatever tabs are 
 ./bin/stg2gl --group "Work" --max 5
 ```
 
+## Triage: tabs to read / note / bookmark
+
+`bin/stg2gl-triage` is for clearing out tabs that have piled up everywhere. It collects them, guesses where each one belongs, lets you correct the guesses in a markdown file, then sends each one to its destination.
+
+| Category | Destination |
+|---|---|
+| `read` | GoodLinks, with the same tags `stg2gl` adds |
+| `note` | Appended to `Tab inbox.md` in the Obsidian vault |
+| `bookmark` | A bookmarks HTML file to import into Safari, plus `bookmarks/Bookmarks inbox.md` in the vault |
+| `skip` | Nowhere. Recorded so it stops coming back |
+| `unsorted` | Left in the triage file for next time |
+
+### The loop
+
+```bash
+./bin/stg2gl-triage collect --dry-run   # see each guess and the rule behind it
+./bin/stg2gl-triage collect             # write ~/Documents/stg2gl/triage.md
+# open triage.md, move lines between the ## sections, save
+./bin/stg2gl-triage apply --dry-run     # see where everything will go
+./bin/stg2gl-triage apply
+./bin/stg2gl-triage status
+```
+
+Editing the triage file:
+
+- Moving a line to a different section changes where it goes.
+- Text typed after a line's tags is kept. On `note` lines it goes into the inbox next to the link.
+- Deleting a line drops it for this run. If the tab is still open, it comes back next time. To stop seeing it, put it under `skip`.
+
+`apply` records every URL it routes in a ledger (`~/.stg2gl/ledger.db`), and `collect` hides ledger URLs, so a tab you keep open is only triaged once. Use `--include-seen` to show them anyway. If a destination fails, `apply` leaves those lines in the triage file and exits 2, and running `apply` again retries them. `collect` will not overwrite a triage file whose edits have not been applied yet unless you pass `--force`.
+
+`apply` does not close tabs. Close them yourself once the run is done.
+
+### Sources
+
+| Source | How it is read | Permission needed |
+|---|---|---|
+| Every open window on this Mac | `scripts/export_all_windows.applescript` | Automation (Safari) |
+| Tab Groups, including ones not open | `SafariTabs.db` (`sources.tab_groups.method: "db"`) | Full Disk Access |
+| Tab Groups, fallback | Clicks each name in `sources.tab_groups.names` (`method: "gui"`) | Accessibility |
+| iPhone / iPad / other Macs | `CloudTabs.db` (iCloud Tabs) | Full Disk Access |
+
+Full Disk Access is granted to the terminal app: System Settings > Privacy & Security > Full Disk Access. Each database is copied to a temp folder before it is read, so Safari's own files are never opened directly, and the copy is deleted afterwards.
+
+**Unverified:** Apple does not document either database. The readers in `lib/collect.py` check for the tables and columns they expect. If Safari has changed them, `collect` prints a warning listing the schema it found, skips that source, and reads the others. Check this before relying on these two sources:
+
+```bash
+mkdir -p /tmp/stg2gl-spike && cp ~/Library/Containers/com.apple.Safari/Data/Library/Safari/{SafariTabs,CloudTabs}.db* /tmp/stg2gl-spike/
+sqlite3 /tmp/stg2gl-spike/SafariTabs.db .schema
+sqlite3 /tmp/stg2gl-spike/CloudTabs.db .schema
+```
+
+`gui` mode switches the front window to each group in turn. Group names are partial matches, so "work" can match "Homework".
+
+### Category rules
+
+Rules live in the `triage.category_rules` list of `config/rules.json`. Each rule has a `category` and any of `domains`, `url_regex` and `title_regex`. If a rule lists more than one condition, all of them must match. An optional `why` is shown by `collect --dry-run`.
+
+```json
+{ "category": "read", "why": "newsletter", "domains": ["substack.com"] }
+{ "category": "note", "title_regex": "\\brecipes?\\b" }
+{ "category": "unsorted", "domains": ["docs.google.com"] }
+```
+
+Rules are evaluated in this order:
+
+1. `skip` rules.
+2. Site roots such as `https://example.com/` become bookmarks: a place you go back to, not a thing you finish. Set `"bookmark_bare_domains": false` to turn this off.
+3. Every other rule, in file order. The first match wins. An `unsorted` rule placed above a broad rule carves out an exception to it.
+4. Anything still unmatched goes to `unsorted`.
+
+The seed rules are deliberately small. Add a rule whenever you find yourself moving the same kind of line by hand.
+
+### Triage settings
+
+All of these sit under `"triage"` in `rules.json`. Every key is optional.
+
+| Key | Default |
+|---|---|
+| `vault_path` | `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Wintermute` |
+| `note_inbox` | `Tab inbox.md` (relative to the vault) |
+| `bookmark_inbox` | `bookmarks/Bookmarks inbox.md` (relative to the vault) |
+| `triage_file` | `~/Documents/stg2gl/triage.md` |
+| `ledger` | `~/.stg2gl/ledger.db` |
+| `bookmarks_html_dir` | `~/Downloads` |
+| `sources.windows` | `true` |
+| `sources.tab_groups` | `{"method": "db", "names": [], "exclude": []}` |
+| `sources.icloud` | `{"enabled": true, "exclude_devices": []}`. This Mac is always excluded. |
+
+### Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The tests replace `osascript` and `open` with fakes, so they run on Linux as well as macOS and never touch Safari or GoodLinks.
+
 ## All parameters
 
 | Parameter | Required | Default | Description |
@@ -302,11 +401,20 @@ Domain matching is **substring-based on the hostname**. The key does not support
 ```
 safari-to-goodlinks/
 ├── bin/
-│   └── stg2gl                          # Main CLI (bash). Start here.
+│   ├── stg2gl                          # Main CLI (bash). Start here.
+│   └── stg2gl-triage                   # collect / apply / status (Python)
+├── lib/
+│   ├── stg2gl_core.py                  # Skip + tag rules, GoodLinks save (shared)
+│   ├── collect.py                      # Windows, Tab Groups, iCloud Tabs readers
+│   ├── classify.py                     # read / note / bookmark / skip guesses
+│   ├── triage.py                       # Triage file render + parse
+│   └── route.py                        # Destinations and the ledger
 ├── scripts/
 │   ├── select_tab_group.applescript    # Clicks a Tab Group in Safari's sidebar
 │   ├── export_tabs.applescript         # Reads front window tabs as JSON
+│   ├── export_all_windows.applescript  # Reads every window's tabs (triage)
 │   └── save_to_goodlinks.applescript   # Standalone: save one URL to GoodLinks
+├── tests/                              # python3 -m unittest discover -s tests
 ├── config/
 │   └── rules.json                      # Your active tagging rules
 ├── examples/

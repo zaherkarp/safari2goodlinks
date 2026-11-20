@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""stg2gl-triage: get Safari tabs out and sorted into read / note / bookmark.
+
+Two steps with a human in the middle:
+
+  collect  Read tabs from every Safari window, Tab Groups, and iCloud Tabs
+           (iPhone/iPad). Drop unsaveable URLs and anything already routed,
+           guess a category for each, and write an editable triage file.
+  (edit)   Open the triage file, move lines between sections.
+  apply    Send each section to its destination and record it in the
+           ledger so it does not come back next time.
+  status   Show the triage file's state and the ledger totals.
+
+Config lives in the "triage" section of config/rules.json (or --rules).
+See README.md, "Triage: tabs to read / note / bookmark".
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import sys
+from datetime import datetime
+
+# Resolve lib/ relative to this file (following a symlink, e.g. one placed
+# in ~/bin) so the command works from any working directory.
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(REPO_DIR, "lib"))
+
+import collect  # noqa: E402
+import route  # noqa: E402
+import stg2gl_core as core  # noqa: E402
+from classify import CATEGORIES, UNSORTED, Classifier  # noqa: E402
+from triage import Item, parse, render  # noqa: E402
+
+SAFARI_DIR = "~/Library/Containers/com.apple.Safari/Data/Library/Safari"
+
+# Defaults for every key in the "triage" section. A rules.json that omits
+# the section still works; it just has no category rules, so everything
+# except bare domains lands in "unsorted".
+DEFAULTS = {
+    # Where Obsidian keeps the vault in iCloud. Same path the vault's own
+    # backup script (wintermute scripts/icloud-backup) reads from.
+    "vault_path": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Wintermute",
+    "note_inbox": "Tab inbox.md",                    # relative to vault_path
+    "bookmark_inbox": "bookmarks/Bookmarks inbox.md",  # relative to vault_path
+    # Kept outside the vault on purpose: it is a scratch file rewritten on
+    # every run, and the vault is backed up to git daily.
+    "triage_file": "~/Documents/stg2gl/triage.md",
+    "ledger": "~/.stg2gl/ledger.db",
+    "bookmarks_html_dir": "~/Downloads",
+    "bookmark_bare_domains": True,
+    "sources": {
+        "windows": True,
+        "tab_groups": {
+            # "db": read SafariTabs.db (all groups, no clicking).
+            # "gui": click each group in `names` (needs Accessibility).
+            # "off": skip.
+            "method": "db",
+            "db_path": SAFARI_DIR + "/SafariTabs.db",
+            "names": [],
+            "exclude": [],
+        },
+        "icloud": {
+            "enabled": True,
+            "db_path": SAFARI_DIR + "/CloudTabs.db",
+            "exclude_devices": [],
+        },
+    },
+    "category_rules": [],
+}
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def load_config(rules_path: str):
+    """Return (full rules.json dict, triage section merged over DEFAULTS)."""
+    with open(rules_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    tcfg = copy.deepcopy(DEFAULTS)
+    user = cfg.get("triage", {})
+    for k, v in user.items():
+        if k == "sources" and isinstance(v, dict):
+            # Merge one level deeper so setting sources.icloud.enabled does
+            # not wipe out the default db_path.
+            for sk, sv in v.items():
+                if isinstance(sv, dict) and isinstance(tcfg["sources"].get(sk), dict):
+                    tcfg["sources"][sk].update(sv)
+                else:
+                    tcfg["sources"][sk] = sv
+        else:
+            tcfg[k] = v
+    return cfg, tcfg
+
+
+def vault_file(tcfg, key):
+    return os.path.join(os.path.expanduser(tcfg["vault_path"]), tcfg[key])
+
+
+def warn(msg):
+    print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# collect
+# ---------------------------------------------------------------------------
+
+def gather(tcfg, cfg, only):
+    """Run each enabled collector. Returns (records, per-source counts)."""
+    src = tcfg["sources"]
+    gtf = cfg.get("group_tag_format", "tg/{group}")
+    jobs = []
+    if "windows" in only and src.get("windows", True):
+        jobs.append(("windows", lambda: collect.from_windows(REPO_DIR)))
+    tg = src.get("tab_groups", {})
+    if "tab-groups" in only:
+        if tg.get("method") == "db":
+            jobs.append(("tab-groups", lambda: collect.from_tab_groups_db(tg["db_path"], gtf, tg.get("exclude", []))))
+        elif tg.get("method") == "gui" and tg.get("names"):
+            jobs.append(("tab-groups", lambda: collect.from_tab_groups_gui(REPO_DIR, tg["names"], gtf)))
+    ic = src.get("icloud", {})
+    if "icloud" in only and ic.get("enabled", True):
+        jobs.append(("icloud", lambda: collect.from_icloud(ic["db_path"], ic.get("exclude_devices", []))))
+
+    records, counts = [], {}
+    for name, job in jobs:
+        try:
+            got = job()
+        except collect.CollectError as e:
+            warn(f"Warning: {name}: {e}")
+            counts[name] = "error"
+            continue
+        counts[name] = len(got)
+        records.extend(got)
+    return records, counts
+
+
+def build_items(records, carried, rules, classifier, ledger, include_seen):
+    """Filter, dedupe, tag and classify. Returns (items, stats)."""
+    stats = {"skipped_rule": 0, "already_routed": 0, "duplicates": 0}
+    by_key = {}
+    hidden = set()  # keys hidden because already routed; repeats count as duplicates
+    order = []
+
+    for r in records:
+        url, title = r["url"], r["title"]
+        if rules.should_skip(url):
+            stats["skipped_rule"] += 1
+            continue
+        key = core.url_key(url)
+        if key in by_key:
+            # Same page open in two places: one line, both source tags.
+            stats["duplicates"] += 1
+            it = by_key[key]
+            if r["source"] not in it.tags:
+                it.tags.insert(0, r["source"])
+            continue
+        if key in hidden:
+            stats["duplicates"] += 1
+            continue
+        if not include_seen and ledger.seen(url):
+            hidden.add(key)
+            stats["already_routed"] += 1
+            continue
+        cat, _why = classifier.classify(url, title)
+        it = Item(title=title, url=url, category=cat,
+                  tags=core.dedupe_keep_order([r["source"]] + rules.content_tags(url, title)))
+        by_key[key] = it
+        order.append(it)
+
+    # Lines left "unsorted" last time come back even if the tab was closed,
+    # so a decision deferred is never lost. Their category stays unsorted.
+    for it in carried:
+        key = core.url_key(it.url)
+        if key in by_key or (not include_seen and ledger.seen(it.url)):
+            continue
+        it.category = UNSORTED
+        by_key[key] = it
+        order.append(it)
+    return order, stats
+
+
+def cmd_collect(args):
+    cfg, tcfg = load_config(args.rules)
+    path = os.path.expanduser(args.file or tcfg["triage_file"])
+
+    carried = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            state, old_items, _w = parse(f.read())
+        if state != "applied" and not args.force and not args.dry_run:
+            warn(f"Error: {path} has edits that were not applied yet (state={state or 'unknown'}).")
+            warn("Run `stg2gl-triage apply` first, or pass --force to discard them.")
+            return 1
+        if state == "applied":
+            carried = [it for it in old_items if it.category == UNSORTED]
+
+    rules = core.TagRules(cfg)
+    classifier = Classifier(tcfg)
+    ledger = route.Ledger(tcfg["ledger"])
+    try:
+        records, counts = gather(tcfg, cfg, set(args.only))
+        items, stats = build_items(records, carried, rules, classifier, ledger, args.include_seen)
+    finally:
+        ledger.close()
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if args.dry_run:
+        for it in items:
+            _cat, why = classifier.classify(it.url, it.title)
+            print(f"[{it.category:8}] {it.title[:70]!r}")
+            print(f"           {it.url}")
+            print(f"           tags: {' '.join(it.tags)}   why: {why}")
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(render(items, stamp))
+        os.replace(tmp, path)  # atomic: a crash never leaves half a file
+
+    per_cat = {c: 0 for c in (UNSORTED,) + CATEGORIES}
+    for it in items:
+        per_cat[it.category] += 1
+
+    warn("")
+    warn("=== Collect Report ===")
+    for name, n in counts.items():
+        warn(f"Source {name + ':':12} {n}")
+    warn(f"Skipped by rule:     {stats['skipped_rule']}")
+    warn(f"Already routed:      {stats['already_routed']}" + ("" if args.include_seen else "  (use --include-seen to show)"))
+    warn(f"Duplicates merged:   {stats['duplicates']}")
+    if carried:
+        warn(f"Carried unsorted:    {len(carried)}")
+    warn("In triage file:      " + "  ".join(f"{c}={n}" for c, n in per_cat.items()))
+    warn("")
+    if args.dry_run:
+        warn("Dry run: triage file not written.")
+    else:
+        warn(f"Wrote {path}")
+        warn("Edit it, then run: stg2gl-triage apply")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# apply
+# ---------------------------------------------------------------------------
+
+def cmd_apply(args):
+    cfg, tcfg = load_config(args.rules)
+    path = os.path.expanduser(args.file or tcfg["triage_file"])
+    if not os.path.exists(path):
+        warn(f"Error: no triage file at {path}. Run `stg2gl-triage collect` first.")
+        return 1
+    with open(path, encoding="utf-8") as f:
+        state, items, warnings = parse(f.read())
+    for w in warnings:
+        warn(f"Warning: {w}")
+    if state == "applied" and not args.force:
+        warn(f"Nothing to apply: {path} was already applied. Run collect for a fresh batch.")
+        return 0
+
+    groups = {c: [it for it in items if it.category == c] for c in (UNSORTED,) + CATEGORIES}
+    throttle = args.throttle if args.throttle is not None else int(cfg.get("throttle_ms", 50))
+    note_path = vault_file(tcfg, "note_inbox")
+    bm_path = vault_file(tcfg, "bookmark_inbox")
+    now = datetime.now()
+    date, stamp = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d-%H%M")
+
+    if args.dry_run:
+        for it in groups["read"]:
+            print(f"[read    ] GoodLinks  {it.url}  tags: {' '.join(it.tags)}")
+        for it in groups["note"]:
+            print(f"[note    ] {note_path}  {it.url}")
+        for it in groups["bookmark"]:
+            print(f"[bookmark] {tcfg['bookmarks_html_dir']} + {bm_path}  {it.url}")
+        for it in groups["skip"]:
+            print(f"[skip    ] ledger only  {it.url}")
+        warn(f"Dry run: nothing written. unsorted={len(groups[UNSORTED])} stays in the file.")
+        return 0
+
+    # Pre-flight every destination BEFORE writing anything, so a missing
+    # app or wrong vault path cannot leave a half-applied batch behind.
+    if groups["read"]:
+        core.check_goodlinks_available()  # exits 1 if GoodLinks is missing
+    vault = os.path.expanduser(tcfg["vault_path"])
+    if (groups["note"] or groups["bookmark"]) and not os.path.isdir(vault):
+        warn(f"Error: vault not found at {vault}. Set triage.vault_path in {args.rules}.")
+        return 1
+
+    ledger = route.Ledger(tcfg["ledger"])
+    failed = []   # (item, reason): stay in the triage file for a retry
+    routed = {c: 0 for c in CATEGORIES}
+    written = []
+
+    try:
+        # read -> GoodLinks, one at a time; a failure affects only that item.
+        for it in groups["read"]:
+            res = core.save_goodlinks(it.url, it.tags, throttle)
+            if res is True:
+                ledger.record(it.url, it.title, "read")
+                routed["read"] += 1
+            else:
+                failed.append((it, res))
+        ledger.commit()
+
+        # note -> one append; all or nothing.
+        if groups["note"]:
+            try:
+                route.append_note_inbox(note_path, groups["note"], date)
+                for it in groups["note"]:
+                    ledger.record(it.url, it.title, "note")
+                routed["note"] = len(groups["note"])
+                written.append(note_path)
+            except OSError as e:
+                failed.extend((it, f"note inbox: {e}") for it in groups["note"])
+            ledger.commit()
+
+        # bookmark -> import file + vault inbox. Counted as routed only if
+        # both writes succeed.
+        if groups["bookmark"]:
+            try:
+                html_path = route.write_bookmarks_html(tcfg["bookmarks_html_dir"], groups["bookmark"], stamp)
+                written.append(html_path)
+                route.append_bookmark_inbox(bm_path, groups["bookmark"], date)
+                written.append(bm_path)
+                for it in groups["bookmark"]:
+                    ledger.record(it.url, it.title, "bookmark")
+                routed["bookmark"] = len(groups["bookmark"])
+            except OSError as e:
+                failed.extend((it, f"bookmarks: {e}") for it in groups["bookmark"])
+            ledger.commit()
+
+        # skip -> ledger only.
+        for it in groups["skip"]:
+            ledger.record(it.url, it.title, "skip")
+        routed["skip"] = len(groups["skip"])
+    finally:
+        ledger.close()
+
+    # Rewrite the triage file with only what is left: unsorted lines, plus
+    # failures in their original section so `apply` can simply be re-run.
+    remaining = groups[UNSORTED] + [it for it, _ in failed]
+    new_state = "pending" if failed else "applied"
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(render(remaining, now.strftime("%Y-%m-%d %H:%M") + " (after apply)", state=new_state))
+    os.replace(tmp, path)
+
+    warn("")
+    warn("=== Apply Report ===")
+    for c in CATEGORIES:
+        warn(f"{c + ':':10} {routed[c]} routed")
+    warn(f"unsorted:  {len(groups[UNSORTED])} kept for next time")
+    for p in written:
+        warn(f"Wrote {p}")
+    if any(p.endswith(".html") for p in written):
+        warn("Import into Safari: File > Import From > Bookmarks HTML File.")
+    if failed:
+        warn("")
+        warn("--- Failed (left in the triage file; re-run apply) ---")
+        for it, why in failed:
+            warn(f"  {it.url}")
+            warn(f"    {it.title[:60]}  [{why}]")
+    total = sum(len(groups[c]) for c in CATEGORIES)
+    status = "PARTIAL_FAILURE" if failed else "OK"
+    warn("")
+    warn(f"Done. total={total} saved={sum(routed.values())} skipped={len(groups[UNSORTED])} failed={len(failed)} status={status}")
+    return 2 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+def cmd_status(args):
+    _cfg, tcfg = load_config(args.rules)
+    path = os.path.expanduser(args.file or tcfg["triage_file"])
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            state, items, _w = parse(f.read())
+        counts = {c: 0 for c in (UNSORTED,) + CATEGORIES}
+        for it in items:
+            counts[it.category] += 1
+        print(f"Triage file: {path}  state={state or 'unknown'}")
+        print("  " + "  ".join(f"{c}={n}" for c, n in counts.items()))
+    else:
+        print(f"Triage file: {path}  (none yet)")
+    ledger_path = os.path.expanduser(tcfg["ledger"])
+    if os.path.exists(ledger_path):
+        ledger = route.Ledger(ledger_path)
+        c = ledger.counts()
+        ledger.close()
+        print(f"Ledger: {ledger_path}  total={sum(c.values())}  " + "  ".join(f"{k}={v}" for k, v in sorted(c.items())))
+    else:
+        print(f"Ledger: {ledger_path}  (none yet)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    default_rules = os.environ.get("RULES_FILE", os.path.join(REPO_DIR, "config", "rules.json"))
+    p = argparse.ArgumentParser(prog="stg2gl-triage", description=__doc__.split("\n\n")[0])
+    p.add_argument("--rules", default=default_rules, help="rules JSON (default: config/rules.json or $RULES_FILE)")
+    p.add_argument("--file", help="triage file path (default: triage.triage_file in rules)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("collect", help="read tabs and write the triage file")
+    c.add_argument("--dry-run", action="store_true", help="print guesses with reasons; write nothing")
+    c.add_argument("--force", action="store_true", help="overwrite a triage file that has unapplied edits")
+    c.add_argument("--include-seen", action="store_true", help="also show tabs already routed on an earlier run")
+    c.add_argument("--only", nargs="+", choices=["windows", "tab-groups", "icloud"],
+                   default=["windows", "tab-groups", "icloud"], help="limit which sources are read")
+    c.set_defaults(func=cmd_collect)
+
+    a = sub.add_parser("apply", help="route each section to its destination")
+    a.add_argument("--dry-run", action="store_true", help="print the routing; write nothing")
+    a.add_argument("--force", action="store_true", help="apply a file already marked applied")
+    a.add_argument("--throttle", type=int, help="ms between GoodLinks saves (default: throttle_ms)")
+    a.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("status", help="show triage file state and ledger totals")
+    s.set_defaults(func=cmd_status)
+
+    args = p.parse_args(argv)
+    if not os.path.isfile(args.rules):
+        warn(f"Error: rules file not found: {args.rules}")
+        return 1
+    if getattr(args, "throttle", None) is not None and not 0 <= args.throttle <= 10000:
+        warn("Error: --throttle must be between 0 and 10000")
+        return 1
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

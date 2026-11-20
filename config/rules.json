@@ -32,5 +32,56 @@
     { "pattern": "\\brfc\\b", "fields": ["title", "url"], "tags": ["rfc"] },
     { "pattern": "\\bchangelog\\b|\\brelease\\b", "fields": ["title"], "tags": ["release-notes"] },
     { "pattern": "\\bapi\\b|\\bsdk\\b|\\bdocs\\b|\\bdocumentation\\b", "fields": ["title"], "tags": ["docs"] }
-  ]
+  ],
+
+  "triage": {
+    "vault_path": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Wintermute",
+    "note_inbox": "Tab inbox.md",
+    "bookmark_inbox": "bookmarks/Bookmarks inbox.md",
+    "triage_file": "~/Documents/stg2gl/triage.md",
+    "ledger": "~/.stg2gl/ledger.db",
+    "bookmarks_html_dir": "~/Downloads",
+    "bookmark_bare_domains": true,
+
+    "sources": {
+      "windows": true,
+      "tab_groups": { "method": "db", "names": [], "exclude": [] },
+      "icloud": { "enabled": true, "exclude_devices": [] }
+    },
+
+    "category_rules": [
+      { "category": "skip", "why": "login, account or checkout page",
+        "url_regex": "/(login|log-in|signin|sign-in|signup|logout|checkout|cart|account|oauth)(/|\\?|$)" },
+      { "category": "skip", "why": "search results",
+        "url_regex": "(google\\.[a-z.]+/search|bing\\.com/search|duckduckgo\\.com/\\?q=|kagi\\.com/search)" },
+      { "category": "skip", "why": "web app, not content",
+        "domains": ["mail.google.com", "calendar.google.com", "icloud.com", "web.whatsapp.com"] },
+
+      { "category": "unsorted", "why": "Google Docs file: decide by hand",
+        "domains": ["docs.google.com", "drive.google.com"] },
+
+      { "category": "note", "why": "Q&A answer: keep the fact",
+        "domains": ["stackoverflow.com", "stackexchange.com", "superuser.com", "serverfault.com", "askubuntu.com"] },
+      { "category": "note", "why": "encyclopedia entry",
+        "domains": ["wikipedia.org"] },
+      { "category": "note", "why": "recipe",
+        "title_regex": "\\brecipes?\\b" },
+
+      { "category": "bookmark", "why": "shop (place, not thing)",
+        "domains": ["rei.com", "etsy.com", "jetpens.com", "countycomm.com", "humangear.com", "mightyedc.com"] },
+      { "category": "bookmark", "why": "documentation site",
+        "domains": ["docs.", "readthedocs.io", "developer.apple.com", "developer.mozilla.org"] },
+
+      { "category": "read", "why": "paper",
+        "domains": ["arxiv.org", "ssrn.com", "biorxiv.org"] },
+      { "category": "read", "why": "newsletter or blog platform",
+        "domains": ["substack.com", "medium.com", "ghost.io", "beehiiv.com"] },
+      { "category": "read", "why": "video to watch",
+        "url_regex": "(youtube\\.com/watch|youtu\\.be/|vimeo\\.com/\\d+)" },
+      { "category": "read", "why": "article-style path",
+        "url_regex": "/(blog|posts?|articles?|essays?|p|news|story)/[^/?#]+" },
+      { "category": "read", "why": "dated path",
+        "url_regex": "/20\\d\\d/\\d\\d/" }
+    ]
+  }
 }
