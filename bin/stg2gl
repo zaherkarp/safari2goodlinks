@@ -175,6 +175,7 @@ STG2GL_GROUP="$GROUP" \
 STG2GL_MODE="$MODE" \
 STG2GL_OUTPUT="$OUTPUT" \
 STG2GL_OUTPUT_FILE="$OUTPUT_FILE" \
+STG2GL_LIB_DIR="$REPO_DIR/lib" \
 python3 - <<'PY'
 import json, os, re, subprocess, sys, time, urllib.parse
 from datetime import datetime, timezone
@@ -210,123 +211,31 @@ if not isinstance(tabs, list):
     sys.exit(1)
 base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
 
-skip_prefixes = tuple(cfg.get("skip_url_prefixes", []))
+# Skip/tag rules and the GoodLinks backend live in lib/stg2gl_core.py so
+# bin/stg2gl-triage can share them. The wrappers below keep the names and
+# signatures the main loop already uses, so nothing else here changed.
+sys.path.insert(0, os.environ["STG2GL_LIB_DIR"])
+import stg2gl_core as core
 
-# Validate and compile skip regexes (reject invalid patterns early)
-skip_regex = []
-for p in cfg.get("skip_url_regex", []):
-    try:
-        skip_regex.append(re.compile(p))
-    except re.error as e:
-        print(f"Warning: invalid skip_url_regex pattern {p!r}: {e}", file=sys.stderr)
-
-domain_tags  = cfg.get("domain_tags", {})
-keyword_tags = cfg.get("keyword_tags", [])
-
-# Use simple string replacement instead of str.format() to prevent
-# format string injection (e.g. {group.__class__} in a malicious rules.json)
-group_tag_template = cfg.get("group_tag_format", "tg/{group}")
-
-# Pre-compile and validate keyword_tags regexes
-compiled_keyword_tags = []
-for rule in keyword_tags:
-    if "tags" not in rule:
-        print(f"Warning: keyword_tags rule missing 'tags' key, skipping: {rule!r}", file=sys.stderr)
-        continue
-    try:
-        pat = re.compile(rule["pattern"], re.I)
-        compiled_keyword_tags.append((pat, rule))
-    except (re.error, KeyError) as e:
-        print(f"Warning: invalid keyword_tags rule {rule.get('pattern', '?')!r}: {e}", file=sys.stderr)
-
-def norm_tag(t):
-    return t.strip().lower().replace(" ", "-")
+rules = core.TagRules(cfg)  # compiles regexes; warns on bad patterns
 
 def should_skip(url):
-    """Check if a URL should be skipped.
-    Returns False if OK, or a string describing the skip reason."""
-    if not url:
-        return "empty URL"
-    for p in skip_prefixes:
-        if url.startswith(p):
-            return f"unsaveable URL (prefix: {p})"
-    for rx in skip_regex:
-        if rx.search(url):
-            return f"blocked pattern ({rx.pattern})"
-    return False
-
-def host_of(url):
-    try:
-        return urllib.parse.urlparse(url).netloc.lower()
-    except Exception:
-        return ""
+    """False if OK, else a reason string (see core.TagRules.should_skip)."""
+    return rules.should_skip(url)
 
 def apply_rules(url, title, group_name):
-    tags = []
-    # Safe string replacement — no Python format string interpretation
-    tags.append(norm_tag(group_tag_template.replace("{group}", group_name)))
-    for bt in base_tags:
-        if bt:
-            tags.append(norm_tag(bt))
-
-    host = host_of(url)
-    for k, v in domain_tags.items():
-        if k.lower() in host:
-            tags.extend([norm_tag(x) for x in v])
-
-    title_l = (title or "").lower()
-    url_l = url.lower()
-
-    for pat, rule in compiled_keyword_tags:
-        fields = rule.get("fields", ["title", "url"])
-        hay = ""
-        if "title" in fields:
-            hay += title_l + " "
-        if "url" in fields:
-            hay += url_l
-        if pat.search(hay):
-            tags.extend([norm_tag(x) for x in rule["tags"]])
-
-    # de-dupe tags while preserving order
-    out = []
-    seen = set()
-    for t in tags:
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    return rules.apply_rules(url, title, group_name, base_tags)
 
 
 # ---------------------------------------------------------------------------
 # Output backends
 # ---------------------------------------------------------------------------
 
-def check_goodlinks_available():
-    """Pre-flight: verify GoodLinks.app is installed and can handle its URL scheme."""
-    result = subprocess.run(
-        ["open", "-Ra", "GoodLinks"],
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        print(
-            "Error: GoodLinks.app not found. Install it or use --output json/sqlite/markdown.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+check_goodlinks_available = core.check_goodlinks_available
 
 def save_goodlinks(url, title, tags):
-    """Save via GoodLinks URL scheme (triggers iCloud sync).
-    Returns True on success, error string on failure."""
-    gl = "goodlinks://x-callback-url/save?quick=1&url={u}&tags={t}".format(
-        u=urllib.parse.quote(url, safe=""),
-        t=urllib.parse.quote(" ".join(tags), safe=""),
-    )
-    result = subprocess.run(["open", gl], capture_output=True)
-    time.sleep(throttle_ms / 1000.0)
-    if result.returncode != 0:
-        stderr_msg = result.stderr.decode("utf-8", errors="replace").strip()
-        return f"open exited {result.returncode}: {stderr_msg}" if stderr_msg else f"open exited {result.returncode}"
-    return True
+    """Save via GoodLinks URL scheme. True on success, error string on failure."""
+    return core.save_goodlinks(url, tags, throttle_ms)
 
 def save_json(url, title, tags, items_buffer):
     """Collect items into buffer; written to disk at end."""
@@ -389,13 +298,8 @@ def flush_sqlite(db_conn, path, count):
     db_conn.close()
     print(f"Wrote {count} items to {path}", file=sys.stderr)
 
-def _md_escape_link_text(s):
-    """Escape characters that break markdown link text: [ ] and newlines."""
-    return s.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]").replace("\n", " ")
-
-def _md_escape_url(s):
-    """Escape characters that break markdown link URLs: ( ) and newlines."""
-    return s.replace("(", "%28").replace(")", "%29").replace("\n", "")
+_md_escape_link_text = core.md_escape_link_text
+_md_escape_url = core.md_escape_url
 
 def save_markdown(url, title, tags, md_lines):
     """Collect Markdown lines into buffer; written to disk at end."""
