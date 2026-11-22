@@ -17,7 +17,8 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
-from stg2gl_core import url_key
+import stg2gl_core as core
+from stg2gl_core import site_of, url_key
 
 # Tags that say where a tab came from rather than what it is about. They are
 # kept on GoodLinks saves but ignored when picking a topic heading.
@@ -34,11 +35,19 @@ def topic_tags(tags):
 # ---------------------------------------------------------------------------
 
 class Ledger:
-    """SQLite record of every URL already routed, keyed by url_key().
+    """SQLite state for stg2gl-triage (default ~/.stg2gl/ledger.db).
 
-    collect hides ledger URLs so a tab that stays open for weeks is only
-    triaged once. Recording uses INSERT OR REPLACE so moving a URL to a
-    different category on a later run (with --include-seen) updates it.
+    Tables:
+      routed     every URL already routed, keyed by url_key(). collect
+                 hides these, so a tab that stays open for weeks is only
+                 triaged once. INSERT OR REPLACE lets a later run (with
+                 --include-seen) change the category.
+      guesses    the tool's guess for each tab waiting in the triage file,
+                 so apply can tell what Z changed. Deleted once routed.
+      decisions  one row per tab Z routed: site, guess, final category.
+                 learn.py derives learned rules and statistics from it.
+      runs       one row per collect: how many tabs were classified and
+                 how many no rule could place. Feeds `status` advice.
     """
 
     def __init__(self, path: str):
@@ -56,6 +65,35 @@ class Ledger:
             )
             """
         )
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS guesses (
+                url_key TEXT PRIMARY KEY,
+                site    TEXT NOT NULL,
+                guess   TEXT NOT NULL,
+                why     TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS decisions (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_key  TEXT NOT NULL,
+                site     TEXT NOT NULL,
+                guessed  TEXT NOT NULL,
+                why      TEXT NOT NULL,
+                final    TEXT NOT NULL,
+                at       TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS decisions_site ON decisions(site);
+            CREATE TABLE IF NOT EXISTS runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                at          TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                total       INTEGER NOT NULL,
+                unsorted    INTEGER NOT NULL,
+                auto_routed INTEGER NOT NULL,
+                labeled     INTEGER NOT NULL
+            );
+            """
+        )
 
     def seen(self, url: str) -> bool:
         cur = self.conn.execute("SELECT 1 FROM routed WHERE url_key = ?", (url_key(url),))
@@ -65,6 +103,45 @@ class Ledger:
         self.conn.execute(
             "INSERT OR REPLACE INTO routed (url_key, url, title, category, routed_at) VALUES (?, ?, ?, ?, ?)",
             (url_key(url), url, title, category, datetime.now(timezone.utc).isoformat()),
+        )
+
+    # -- guesses / decisions (learning) ------------------------------------
+
+    def remember_guess(self, url: str, guess: str, why: str):
+        """Store the guess for a tab entering the triage file. Keeps an
+        existing guess, because a tab carried over from an earlier collect
+        was first judged then."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO guesses (url_key, site, guess, why) VALUES (?, ?, ?, ?)",
+            (url_key(url), site_of(url), guess, why),
+        )
+
+    def record_decision(self, url: str, final: str):
+        """Called when apply routes a tab: compare Z's choice to the guess."""
+        key = url_key(url)
+        row = self.conn.execute("SELECT guess, why FROM guesses WHERE url_key = ?", (key,)).fetchone()
+        guessed, why = row if row else ("unsorted", "no stored guess")
+        self.conn.execute(
+            "INSERT INTO decisions (url_key, site, guessed, why, final, at) VALUES (?, ?, ?, ?, ?, ?)",
+            (key, site_of(url), guessed, why, final, datetime.now(timezone.utc).isoformat()),
+        )
+        self.conn.execute("DELETE FROM guesses WHERE url_key = ?", (key,))
+
+    def prune_guesses(self, keep_keys):
+        """Drop guesses for tabs no longer in the triage file (Z deleted the
+        line). Without this the table would only ever grow."""
+        keep = set(keep_keys)
+        stale = [k for (k,) in self.conn.execute("SELECT url_key FROM guesses") if k not in keep]
+        self.conn.executemany("DELETE FROM guesses WHERE url_key = ?", [(k,) for k in stale])
+
+    def forget_site(self, site: str) -> int:
+        cur = self.conn.execute("DELETE FROM decisions WHERE site = ?", (site,))
+        return cur.rowcount
+
+    def record_run(self, kind: str, total: int, unsorted: int, auto_routed: int, labeled: int):
+        self.conn.execute(
+            "INSERT INTO runs (at, kind, total, unsorted, auto_routed, labeled) VALUES (?, ?, ?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), kind, total, unsorted, auto_routed, labeled),
         )
 
     def counts(self):
@@ -184,3 +261,99 @@ def write_bookmarks_html(out_dir: str, items, stamp: str) -> str:
     with open(path, "x", encoding="utf-8") as f:
         f.write(bookmarks_html(items, f"From tabs {stamp}"))
     return path
+
+
+# ---------------------------------------------------------------------------
+# Routing a batch (shared by `apply` and the scheduled `auto` run)
+# ---------------------------------------------------------------------------
+
+# Tabs routed to these categories are closed afterwards when close_tabs is
+# on. "skip" is deliberately absent: skipped tabs are things like webmail
+# and calendars, which you are probably still using.
+CLOSE_AFTER = ("read", "note", "bookmark")
+
+
+def route_batch(groups, tcfg, throttle_ms: int, ledger, now, learn: bool):
+    """Send each category to its destination.
+
+    groups: {category: [Item]} for read/note/bookmark/skip.
+    learn:  True for apply (Z made these choices, record decisions);
+            False for auto (the tool made them, nothing to learn).
+
+    Never raises for a destination failure: failed items are returned so
+    the caller can keep them in the triage file for a retry. Returns
+    {"routed": {cat: n}, "routed_items": [Item], "failed": [(Item, why)],
+     "written": [path]}.
+    """
+    date, stamp = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d-%H%M")
+    vault = os.path.expanduser(tcfg["vault_path"])
+    note_path = os.path.join(vault, tcfg["note_inbox"])
+    bm_path = os.path.join(vault, tcfg["bookmark_inbox"])
+    res = {"routed": {c: 0 for c in ("read", "note", "bookmark", "skip")},
+           "routed_items": [], "failed": [], "written": []}
+
+    def done(items, cat):
+        for it in items:
+            ledger.record(it.url, it.title, cat)
+            if learn:
+                ledger.record_decision(it.url, cat)
+        res["routed"][cat] += len(items)
+        res["routed_items"].extend(items)
+        ledger.commit()  # commit per category: a crash later keeps this work
+
+    # read -> GoodLinks, one at a time; a failure affects only that item.
+    reads = groups.get("read", [])
+    if reads:
+        if not core.goodlinks_available():
+            res["failed"].extend((it, "GoodLinks.app not found") for it in reads)
+        else:
+            ok = []
+            for it in reads:
+                r = core.save_goodlinks(it.url, it.tags, throttle_ms)
+                if r is True:
+                    ok.append(it)
+                else:
+                    res["failed"].append((it, r))
+            done(ok, "read")
+
+    # note -> one append; all or nothing.
+    notes = groups.get("note", [])
+    if notes:
+        try:
+            append_note_inbox(note_path, notes, date)
+            res["written"].append(note_path)
+            done(notes, "note")
+        except OSError as e:
+            res["failed"].extend((it, f"note inbox: {e}") for it in notes)
+
+    # bookmark -> import file + vault inbox; routed only if both succeed.
+    bms = groups.get("bookmark", [])
+    if bms:
+        try:
+            html_path = write_bookmarks_html(tcfg["bookmarks_html_dir"], bms, stamp)
+            res["written"].append(html_path)
+            append_bookmark_inbox(bm_path, bms, date)
+            res["written"].append(bm_path)
+            done(bms, "bookmark")
+        except OSError as e:
+            res["failed"].extend((it, f"bookmarks: {e}") for it in bms)
+
+    # skip -> ledger only.
+    done(groups.get("skip", []), "skip")
+    return res
+
+
+def tabs_to_close(routed_items, tcfg):
+    """url_keys of routed tabs that should be closed, honouring config."""
+    if not tcfg.get("close_tabs", True):
+        return []
+    keep = [d.lower() for d in tcfg.get("close_tabs_keep_domains", [])]
+    out = []
+    for it in routed_items:
+        if it.category not in CLOSE_AFTER:
+            continue
+        host = core.host_of(it.url)
+        if any(k in host for k in keep):
+            continue
+        out.append(url_key(it.url))
+    return out

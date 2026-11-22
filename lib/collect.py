@@ -289,3 +289,24 @@ def from_icloud(db_path: str, exclude_devices=()):
             "source": "device/" + norm_tag(device),
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Closing tabs after they are routed (option 5)
+# ---------------------------------------------------------------------------
+
+def close_window_tabs(repo_dir: str, url_keys) -> int:
+    """Close open-window tabs whose url_key is in `url_keys`. Returns count.
+
+    Raises CollectError if Safari cannot be scripted. Callers treat that as
+    a warning: the tabs were already routed, they are just still open.
+    """
+    keys = list(dict.fromkeys(url_keys))
+    if not keys:
+        return 0
+    script = os.path.join(repo_dir, "scripts", "close_tabs.applescript")
+    out = run_osascript(script, keys, timeout=60).strip()
+    try:
+        return int(out or 0)
+    except ValueError:
+        raise CollectError(f"close_tabs returned {out!r}")

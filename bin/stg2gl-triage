@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """stg2gl-triage: get Safari tabs out and sorted into read / note / bookmark.
 
-Two steps with a human in the middle:
-
-  collect  Read tabs from every Safari window, Tab Groups, and iCloud Tabs
-           (iPhone/iPad). Drop unsaveable URLs and anything already routed,
-           guess a category for each, and write an editable triage file.
-  (edit)   Open the triage file, move lines between sections.
-  apply    Send each section to its destination and record it in the
-           ledger so it does not come back next time.
-  status   Show the triage file's state and the ledger totals.
+  collect   Read tabs from every Safari window, Tab Groups, and iCloud Tabs
+            (iPhone/iPad). Drop unsaveable URLs and anything already routed,
+            guess a category for each, and add them to the triage file.
+  (edit)    Open the triage file, move lines between sections.
+  apply     Send each section to its destination, close those tabs, record
+            what you changed so the guesses improve, and clear the file.
+  auto      What the schedule runs: collect, send tabs matched by rules
+            marked "auto" straight away, close them, and notify you.
+  status    Triage file, ledger, learned rules, and whether page labels
+            would help.
+  forget    Drop what was learned about one site.
+  schedule  install | remove | run-now | show the launchd job for `auto`.
 
 Config lives in the "triage" section of config/rules.json (or --rules).
 See README.md, "Triage: tabs to read / note / bookmark".
@@ -19,23 +22,32 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import json
 import os
+import shutil
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 
 # Resolve lib/ relative to this file (following a symlink, e.g. one placed
 # in ~/bin) so the command works from any working directory.
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SCRIPT = os.path.realpath(__file__)
+REPO_DIR = os.path.dirname(os.path.dirname(SCRIPT))
 sys.path.insert(0, os.path.join(REPO_DIR, "lib"))
 
 import collect  # noqa: E402
+import hints  # noqa: E402
+import learn  # noqa: E402
 import route  # noqa: E402
+import schedule  # noqa: E402
 import stg2gl_core as core  # noqa: E402
 from classify import CATEGORIES, UNSORTED, Classifier  # noqa: E402
-from triage import Item, parse, render  # noqa: E402
+from notify import notify  # noqa: E402
+from triage import Item, parse_full, render, sent_line  # noqa: E402
 
 SAFARI_DIR = "~/Library/Containers/com.apple.Safari/Data/Library/Safari"
+ALL_SECTIONS = (UNSORTED,) + CATEGORIES
 
 # Defaults for every key in the "triage" section. A rules.json that omits
 # the section still works; it just has no category rules, so everything
@@ -44,14 +56,26 @@ DEFAULTS = {
     # Where Obsidian keeps the vault in iCloud. Same path the vault's own
     # backup script (wintermute scripts/icloud-backup) reads from.
     "vault_path": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Wintermute",
-    "note_inbox": "Tab inbox.md",                    # relative to vault_path
+    "note_inbox": "Tab inbox.md",                      # relative to vault_path
     "bookmark_inbox": "bookmarks/Bookmarks inbox.md",  # relative to vault_path
-    # Kept outside the vault on purpose: it is a scratch file rewritten on
-    # every run, and the vault is backed up to git daily.
+    # Outside the vault by default: it is a scratch file rewritten on every
+    # run, and the vault is backed up to git daily.
     "triage_file": "~/Documents/stg2gl/triage.md",
     "ledger": "~/.stg2gl/ledger.db",
     "bookmarks_html_dir": "~/Downloads",
     "bookmark_bare_domains": True,
+    # Option 2: let `auto` send tabs matched by rules marked "auto": true.
+    "auto_route": True,
+    # Option 5: close tabs in open windows after they are routed. Never
+    # applies to "skip". Domains listed here are never closed.
+    "close_tabs": True,
+    "close_tabs_keep_domains": [],
+    # Option 3: learn from what you move by hand.
+    "learn": {"enabled": True, "min_count": 3, "min_share": 0.8},
+    # Option 4: download pages to read their own labels.
+    # "off" | "unsorted" (only tabs no rule placed) | "all"
+    "page_hints": "off",
+    "page_hints_max": 150,
     "sources": {
         "windows": True,
         "tab_groups": {
@@ -74,7 +98,7 @@ DEFAULTS = {
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config, locking, small helpers
 # ---------------------------------------------------------------------------
 
 def load_config(rules_path: str):
@@ -82,8 +106,7 @@ def load_config(rules_path: str):
     with open(rules_path, encoding="utf-8") as f:
         cfg = json.load(f)
     tcfg = copy.deepcopy(DEFAULTS)
-    user = cfg.get("triage", {})
-    for k, v in user.items():
+    for k, v in cfg.get("triage", {}).items():
         if k == "sources" and isinstance(v, dict):
             # Merge one level deeper so setting sources.icloud.enabled does
             # not wipe out the default db_path.
@@ -92,21 +115,65 @@ def load_config(rules_path: str):
                     tcfg["sources"][sk].update(sv)
                 else:
                     tcfg["sources"][sk] = sv
+        elif k == "learn" and isinstance(v, dict):
+            tcfg["learn"].update(v)
         else:
             tcfg[k] = v
+    if tcfg["page_hints"] not in ("off", "unsorted", "all"):
+        warn(f'Warning: page_hints must be "off", "unsorted" or "all"; got {tcfg["page_hints"]!r}. Using "off".')
+        tcfg["page_hints"] = "off"
     return cfg, tcfg
-
-
-def vault_file(tcfg, key):
-    return os.path.join(os.path.expanduser(tcfg["vault_path"]), tcfg[key])
 
 
 def warn(msg):
     print(msg, file=sys.stderr)
 
 
+@contextmanager
+def run_lock(tcfg):
+    """One collect/apply/auto at a time. The scheduled run and a manual
+    apply touching the triage file and ledger together would lose edits."""
+    d = os.path.dirname(os.path.expanduser(tcfg["ledger"])) or "."
+    os.makedirs(d, exist_ok=True)
+    f = open(os.path.join(d, "lock"), "w")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("Another stg2gl-triage run is in progress. Try again in a minute.")
+        yield
+    finally:
+        f.close()  # closing releases the lock
+
+
+def write_triage(path, items, state, sent=(), note=""):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(render(items, datetime.now().strftime("%Y-%m-%d %H:%M") + note, state=state, sent=sent))
+    os.replace(tmp, path)  # atomic: a crash never leaves half a file
+
+
+def make_classifier(tcfg, ledger):
+    lc = tcfg["learn"]
+    learned = learn.learned_rules(ledger.conn, lc["min_count"], lc["min_share"]) if lc.get("enabled", True) else []
+    return Classifier(tcfg, learned), learned
+
+
+def close_tabs(items, tcfg, dry_run=False):
+    """Close routed tabs (option 5). Returns count; warns instead of failing."""
+    keys = route.tabs_to_close(items, tcfg)
+    if not keys or dry_run:
+        return 0
+    try:
+        return collect.close_window_tabs(REPO_DIR, keys)
+    except collect.CollectError as e:
+        warn(f"Warning: could not close tabs: {e}")
+        return 0
+
+
 # ---------------------------------------------------------------------------
-# collect
+# collect / auto
 # ---------------------------------------------------------------------------
 
 def gather(tcfg, cfg, only):
@@ -139,110 +206,184 @@ def gather(tcfg, cfg, only):
     return records, counts
 
 
-def build_items(records, carried, rules, classifier, ledger, include_seen):
-    """Filter, dedupe, tag and classify. Returns (items, stats)."""
-    stats = {"skipped_rule": 0, "already_routed": 0, "duplicates": 0}
-    by_key = {}
-    hidden = set()  # keys hidden because already routed; repeats count as duplicates
-    order = []
+def new_items_from(records, existing, rules, ledger, include_seen):
+    """Filter, dedupe and tag records that are not already in the file.
 
+    Returns (new items, stats). Classification happens afterwards, because
+    page labels (if on) are added between the first guess and the final one.
+    """
+    stats = {"skipped_rule": 0, "already_routed": 0, "duplicates": 0, "already_in_file": 0}
+    in_file = {core.url_key(it.url): it for it in existing}
+    by_key, hidden, out = {}, set(), []
     for r in records:
         url, title = r["url"], r["title"]
         if rules.should_skip(url):
             stats["skipped_rule"] += 1
             continue
         key = core.url_key(url)
+        if key in in_file:
+            stats["already_in_file"] += 1
+            continue
         if key in by_key:
             # Same page open in two places: one line, both source tags.
             stats["duplicates"] += 1
-            it = by_key[key]
-            if r["source"] not in it.tags:
-                it.tags.insert(0, r["source"])
+            if r["source"] not in by_key[key].tags:
+                by_key[key].tags.insert(0, r["source"])
             continue
-        if key in hidden:
+        if key in hidden:  # repeat of a URL already hidden as routed
             stats["duplicates"] += 1
             continue
         if not include_seen and ledger.seen(url):
             hidden.add(key)
             stats["already_routed"] += 1
             continue
-        cat, _why = classifier.classify(url, title)
-        it = Item(title=title, url=url, category=cat,
+        it = Item(title=title, url=url,
                   tags=core.dedupe_keep_order([r["source"]] + rules.content_tags(url, title)))
         by_key[key] = it
-        order.append(it)
+        out.append(it)
+    return out, stats
 
-    # Lines left "unsorted" last time come back even if the tab was closed,
-    # so a decision deferred is never lost. Their category stays unsorted.
-    for it in carried:
-        key = core.url_key(it.url)
-        if key in by_key or (not include_seen and ledger.seen(it.url)):
-            continue
-        it.category = UNSORTED
-        by_key[key] = it
-        order.append(it)
-    return order, stats
+
+def add_page_labels(items, guesses, classifier, tcfg):
+    """Option 4. Fetch labels for selected items and re-guess them.
+
+    Labels are added as tags. Re-guessing only changes the category if a
+    rule uses a "page" condition; otherwise labels are information only.
+    Returns how many items got at least one label.
+    """
+    mode = tcfg["page_hints"]
+    if mode == "off":
+        return 0
+    targets = [it for it in items if mode == "all" or guesses[id(it)].category == UNSORTED]
+    targets = targets[: int(tcfg.get("page_hints_max", 150))]
+    results = hints.fetch_many([it.url for it in targets])
+    labeled = 0
+    for it in targets:
+        labels, _err = results.get(it.url, ([], None))
+        if labels:
+            labeled += 1
+            it.tags = core.dedupe_keep_order(it.tags + labels)
+            guesses[id(it)] = classifier.classify(it.url, it.title, it.tags)
+    return labeled
 
 
 def cmd_collect(args):
     cfg, tcfg = load_config(args.rules)
     path = os.path.expanduser(args.file or tcfg["triage_file"])
+    auto = getattr(args, "auto", False)
+    with run_lock(tcfg):
+        return _collect(args, cfg, tcfg, path, auto)
 
-    carried = []
-    if os.path.exists(path):
+
+def _collect(args, cfg, tcfg, path, auto):
+    # 1. What is already in the triage file stays, with Z's edits.
+    existing, sent = [], []
+    if os.path.exists(path) and not args.force:
         with open(path, encoding="utf-8") as f:
-            state, old_items, _w = parse(f.read())
-        if state != "applied" and not args.force and not args.dry_run:
-            warn(f"Error: {path} has edits that were not applied yet (state={state or 'unknown'}).")
-            warn("Run `stg2gl-triage apply` first, or pass --force to discard them.")
-            return 1
+            state, old_items, _w, old_sent = parse_full(f.read())
         if state == "applied":
-            carried = [it for it in old_items if it.category == UNSORTED]
+            # After apply only unsorted lines remain; bring them back.
+            existing = [it for it in old_items if it.category == UNSORTED]
+        else:
+            # Pending (or hand-made): keep every line where Z put it, and
+            # the record of what was already sent automatically.
+            existing, sent = old_items, old_sent
 
     rules = core.TagRules(cfg)
-    classifier = Classifier(tcfg)
     ledger = route.Ledger(tcfg["ledger"])
     try:
+        classifier, _learned = make_classifier(tcfg, ledger)
+        # Lines routed since they were written (e.g. --include-seen runs)
+        # drop out of the file.
+        existing = [it for it in existing if args.include_seen or not ledger.seen(it.url)]
+
+        # 2. New tabs: gather, filter, guess, optionally label.
         records, counts = gather(tcfg, cfg, set(args.only))
-        items, stats = build_items(records, carried, rules, classifier, ledger, args.include_seen)
+        new, stats = new_items_from(records, existing, rules, ledger, args.include_seen)
+        guesses = {id(it): classifier.classify(it.url, it.title, it.tags) for it in new}
+        labeled = add_page_labels(new, guesses, classifier, tcfg)  # 0 when page_hints is off
+        for it in new:
+            it.category = guesses[id(it)].category
+        unsorted_n = sum(1 for it in new if it.category == UNSORTED)
+
+        # 3. Option 2: in `auto`, rules marked "auto" send immediately.
+        auto_on = auto and tcfg.get("auto_route", True)
+        send_now = [it for it in new if auto_on and guesses[id(it)].auto]
+        sending = {id(it) for it in send_now}
+        review = [it for it in new if id(it) not in sending]
+
+        if args.dry_run:
+            for it in new:
+                g = guesses[id(it)]
+                flag = " AUTO" if id(it) in sending else ""
+                print(f"[{it.category:8}{flag}] {it.title[:70]!r}")
+                print(f"           {it.url}")
+                print(f"           tags: {' '.join(it.tags)}   why: {g.why}")
+            routed = {"routed": {}, "failed": [], "routed_items": []}
+            closed = 0
+        else:
+            for it in review:
+                g = guesses[id(it)]
+                ledger.remember_guess(it.url, g.category, g.why)
+            ledger.record_run("auto" if auto else "collect", len(new), unsorted_n, len(send_now), labeled)
+            ledger.commit()
+            routed = {"routed": {}, "failed": [], "routed_items": []}
+            if send_now:
+                groups = {c: [it for it in send_now if it.category == c] for c in CATEGORIES}
+                throttle = int(cfg.get("throttle_ms", 50))
+                routed = route.route_batch(groups, tcfg, throttle, ledger, datetime.now(), learn=False)
+                for it in routed["routed_items"]:
+                    sent.append(sent_line(it, guesses[id(it)].why))
+                # A failed auto send goes back to review in its section.
+                for it, _why in routed["failed"]:
+                    ledger.remember_guess(it.url, it.category, guesses[id(it)].why)
+                    review.append(it)
+                ledger.commit()
+            closed = close_tabs(routed["routed_items"], tcfg)
+            write_triage(path, existing + review, "pending", sent)
+            ledger.prune_guesses(core.url_key(it.url) for it in existing + review)
+            ledger.commit()
     finally:
         ledger.close()
 
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if args.dry_run:
-        for it in items:
-            _cat, why = classifier.classify(it.url, it.title)
-            print(f"[{it.category:8}] {it.title[:70]!r}")
-            print(f"           {it.url}")
-            print(f"           tags: {' '.join(it.tags)}   why: {why}")
-    else:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(render(items, stamp))
-        os.replace(tmp, path)  # atomic: a crash never leaves half a file
-
-    per_cat = {c: 0 for c in (UNSORTED,) + CATEGORIES}
-    for it in items:
-        per_cat[it.category] += 1
+    in_file = existing + review
+    per_cat = {c: sum(1 for it in in_file if it.category == c) for c in ALL_SECTIONS}
+    sent_n = len(routed["routed_items"])
 
     warn("")
-    warn("=== Collect Report ===")
+    warn("=== Collect Report ===" if not auto else "=== Auto Report ===")
     for name, n in counts.items():
         warn(f"Source {name + ':':12} {n}")
     warn(f"Skipped by rule:     {stats['skipped_rule']}")
     warn(f"Already routed:      {stats['already_routed']}" + ("" if args.include_seen else "  (use --include-seen to show)"))
+    warn(f"Already in file:     {stats['already_in_file']}")
     warn(f"Duplicates merged:   {stats['duplicates']}")
-    if carried:
-        warn(f"Carried unsorted:    {len(carried)}")
+    warn(f"New tabs:            {len(new)}  (no rule matched: {unsorted_n})")
+    if tcfg["page_hints"] != "off":
+        warn(f"Page labels added:   {labeled}")
+    if auto:
+        warn(f"Sent automatically:  {sent_n}" + (f"  failed: {len(routed['failed'])}" if routed["failed"] else ""))
+        warn(f"Tabs closed:         {closed}")
     warn("In triage file:      " + "  ".join(f"{c}={n}" for c, n in per_cat.items()))
+    for it, why in routed["failed"]:
+        warn(f"  auto send failed, kept for review: {it.url}  [{why}]")
     warn("")
     if args.dry_run:
-        warn("Dry run: triage file not written.")
+        warn("Dry run: nothing written, sent or closed.")
     else:
         warn(f"Wrote {path}")
-        warn("Edit it, then run: stg2gl-triage apply")
-    return 0
+        if sum(per_cat.values()):
+            warn("Edit it, then run: stg2gl-triage apply")
+
+    if getattr(args, "notify", False) and not args.dry_run and (new or sent_n):
+        to_sort = sum(per_cat.values())
+        msg = f"{to_sort} tab{'s' if to_sort != 1 else ''} to sort"
+        if sent_n:
+            msg += f", {sent_n} sent automatically"
+        if closed:
+            msg += f", {closed} closed"
+        notify("Tab triage", msg, open_path=path)
+    return 2 if routed["failed"] else 0
 
 
 # ---------------------------------------------------------------------------
@@ -255,109 +396,69 @@ def cmd_apply(args):
     if not os.path.exists(path):
         warn(f"Error: no triage file at {path}. Run `stg2gl-triage collect` first.")
         return 1
+    with run_lock(tcfg):
+        return _apply(args, cfg, tcfg, path)
+
+
+def _apply(args, cfg, tcfg, path):
     with open(path, encoding="utf-8") as f:
-        state, items, warnings = parse(f.read())
+        state, items, warnings, _sent = parse_full(f.read())
     for w in warnings:
         warn(f"Warning: {w}")
     if state == "applied" and not args.force:
         warn(f"Nothing to apply: {path} was already applied. Run collect for a fresh batch.")
         return 0
 
-    groups = {c: [it for it in items if it.category == c] for c in (UNSORTED,) + CATEGORIES}
+    groups = {c: [it for it in items if it.category == c] for c in ALL_SECTIONS}
     throttle = args.throttle if args.throttle is not None else int(cfg.get("throttle_ms", 50))
-    note_path = vault_file(tcfg, "note_inbox")
-    bm_path = vault_file(tcfg, "bookmark_inbox")
-    now = datetime.now()
-    date, stamp = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d-%H%M")
+    vault = os.path.expanduser(tcfg["vault_path"])
 
     if args.dry_run:
         for it in groups["read"]:
             print(f"[read    ] GoodLinks  {it.url}  tags: {' '.join(it.tags)}")
         for it in groups["note"]:
-            print(f"[note    ] {note_path}  {it.url}")
+            print(f"[note    ] {os.path.join(vault, tcfg['note_inbox'])}  {it.url}")
         for it in groups["bookmark"]:
-            print(f"[bookmark] {tcfg['bookmarks_html_dir']} + {bm_path}  {it.url}")
+            print(f"[bookmark] {tcfg['bookmarks_html_dir']} + {os.path.join(vault, tcfg['bookmark_inbox'])}  {it.url}")
         for it in groups["skip"]:
             print(f"[skip    ] ledger only  {it.url}")
-        warn(f"Dry run: nothing written. unsorted={len(groups[UNSORTED])} stays in the file.")
+        n_close = len(route.tabs_to_close([it for c in route.CLOSE_AFTER for it in groups[c]], tcfg))
+        warn(f"Dry run: nothing written. Would close up to {n_close} tabs. "
+             f"unsorted={len(groups[UNSORTED])} stays in the file.")
         return 0
 
     # Pre-flight every destination BEFORE writing anything, so a missing
     # app or wrong vault path cannot leave a half-applied batch behind.
     if groups["read"]:
         core.check_goodlinks_available()  # exits 1 if GoodLinks is missing
-    vault = os.path.expanduser(tcfg["vault_path"])
     if (groups["note"] or groups["bookmark"]) and not os.path.isdir(vault):
         warn(f"Error: vault not found at {vault}. Set triage.vault_path in {args.rules}.")
         return 1
 
     ledger = route.Ledger(tcfg["ledger"])
-    failed = []   # (item, reason): stay in the triage file for a retry
-    routed = {c: 0 for c in CATEGORIES}
-    written = []
-
     try:
-        # read -> GoodLinks, one at a time; a failure affects only that item.
-        for it in groups["read"]:
-            res = core.save_goodlinks(it.url, it.tags, throttle)
-            if res is True:
-                ledger.record(it.url, it.title, "read")
-                routed["read"] += 1
-            else:
-                failed.append((it, res))
-        ledger.commit()
-
-        # note -> one append; all or nothing.
-        if groups["note"]:
-            try:
-                route.append_note_inbox(note_path, groups["note"], date)
-                for it in groups["note"]:
-                    ledger.record(it.url, it.title, "note")
-                routed["note"] = len(groups["note"])
-                written.append(note_path)
-            except OSError as e:
-                failed.extend((it, f"note inbox: {e}") for it in groups["note"])
-            ledger.commit()
-
-        # bookmark -> import file + vault inbox. Counted as routed only if
-        # both writes succeed.
-        if groups["bookmark"]:
-            try:
-                html_path = route.write_bookmarks_html(tcfg["bookmarks_html_dir"], groups["bookmark"], stamp)
-                written.append(html_path)
-                route.append_bookmark_inbox(bm_path, groups["bookmark"], date)
-                written.append(bm_path)
-                for it in groups["bookmark"]:
-                    ledger.record(it.url, it.title, "bookmark")
-                routed["bookmark"] = len(groups["bookmark"])
-            except OSError as e:
-                failed.extend((it, f"bookmarks: {e}") for it in groups["bookmark"])
-            ledger.commit()
-
-        # skip -> ledger only.
-        for it in groups["skip"]:
-            ledger.record(it.url, it.title, "skip")
-        routed["skip"] = len(groups["skip"])
+        res = route.route_batch({c: groups[c] for c in CATEGORIES}, tcfg, throttle, ledger,
+                                datetime.now(), learn=tcfg["learn"].get("enabled", True))
     finally:
         ledger.close()
+    closed = close_tabs(res["routed_items"], tcfg)
 
     # Rewrite the triage file with only what is left: unsorted lines, plus
     # failures in their original section so `apply` can simply be re-run.
+    # The "sent automatically" list is dropped: Z has now seen it.
+    failed = res["failed"]
     remaining = groups[UNSORTED] + [it for it, _ in failed]
-    new_state = "pending" if failed else "applied"
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(render(remaining, now.strftime("%Y-%m-%d %H:%M") + " (after apply)", state=new_state))
-    os.replace(tmp, path)
+    write_triage(path, remaining, "pending" if failed else "applied", note=" (after apply)")
 
     warn("")
     warn("=== Apply Report ===")
     for c in CATEGORIES:
-        warn(f"{c + ':':10} {routed[c]} routed")
+        warn(f"{c + ':':10} {res['routed'][c]} routed")
     warn(f"unsorted:  {len(groups[UNSORTED])} kept for next time")
-    for p in written:
+    warn(f"closed:    {closed} tabs")
+    for p in res["written"]:
         warn(f"Wrote {p}")
-    if any(p.endswith(".html") for p in written):
+    if any(p.endswith(".html") for p in res["written"]):
         warn("Import into Safari: File > Import From > Bookmarks HTML File.")
     if failed:
         warn("")
@@ -368,12 +469,13 @@ def cmd_apply(args):
     total = sum(len(groups[c]) for c in CATEGORIES)
     status = "PARTIAL_FAILURE" if failed else "OK"
     warn("")
-    warn(f"Done. total={total} saved={sum(routed.values())} skipped={len(groups[UNSORTED])} failed={len(failed)} status={status}")
+    warn(f"Done. total={total} saved={sum(res['routed'].values())} skipped={len(groups[UNSORTED])} "
+         f"failed={len(failed)} status={status}")
     return 2 if failed else 0
 
 
 # ---------------------------------------------------------------------------
-# status
+# status / forget
 # ---------------------------------------------------------------------------
 
 def cmd_status(args):
@@ -381,22 +483,106 @@ def cmd_status(args):
     path = os.path.expanduser(args.file or tcfg["triage_file"])
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            state, items, _w = parse(f.read())
-        counts = {c: 0 for c in (UNSORTED,) + CATEGORIES}
-        for it in items:
-            counts[it.category] += 1
+            state, items, _w, sent = parse_full(f.read())
+        counts = {c: sum(1 for it in items if it.category == c) for c in ALL_SECTIONS}
         print(f"Triage file: {path}  state={state or 'unknown'}")
-        print("  " + "  ".join(f"{c}={n}" for c, n in counts.items()))
+        print("  " + "  ".join(f"{c}={n}" for c, n in counts.items()) + f"  sent-automatically={len(sent)}")
     else:
         print(f"Triage file: {path}  (none yet)")
+
     ledger_path = os.path.expanduser(tcfg["ledger"])
-    if os.path.exists(ledger_path):
-        ledger = route.Ledger(ledger_path)
-        c = ledger.counts()
-        ledger.close()
-        print(f"Ledger: {ledger_path}  total={sum(c.values())}  " + "  ".join(f"{k}={v}" for k, v in sorted(c.items())))
-    else:
+    if not os.path.exists(ledger_path):
         print(f"Ledger: {ledger_path}  (none yet)")
+    else:
+        ledger = route.Ledger(ledger_path)
+        try:
+            c = ledger.counts()
+            print(f"Ledger: {ledger_path}  total={sum(c.values())}  "
+                  + "  ".join(f"{k}={v}" for k, v in sorted(c.items())))
+
+            lc = tcfg["learn"]
+            learned = learn.learned_rules(ledger.conn, lc["min_count"], lc["min_share"])
+            print("")
+            if not lc.get("enabled", True):
+                print("Learning: off")
+            elif learned:
+                print(f"Learned rules ({len(learned)}):")
+                for site, cat, why in learned:
+                    print(f"  {site:32} -> {cat:8}  ({why.split(': ', 1)[1]})")
+            else:
+                print(f"Learned rules: none yet (needs {lc['min_count']} tabs from one site sorted the same way)")
+
+            over = learn.overridden_rules(ledger.conn)
+            if over:
+                print("\nRules you keep overriding (edit these in rules.json):")
+                for why, guessed, final, n in over:
+                    print(f"  {why!r}: guessed {guessed}, you chose {final} {n} times")
+
+            h = learn.sorting_health(ledger.conn)
+            if h["classified"]:
+                u = "n/a" if h["unsorted_share"] is None else f"{h['unsorted_share']:.0%}"
+                cs = "n/a" if h["correction_share"] is None else f"{h['correction_share']:.0%}"
+                runs = "Last run" if h["runs"] == 1 else f"Last {h['runs']} runs"
+                print(f"\n{runs}: {h['classified']} new tabs, {u} matched no rule. "
+                      f"Guesses you changed: {cs} of {h['guessed_routed']}.")
+            print(f"Page labels: {tcfg['page_hints']}")
+            advice = learn.page_hint_advice(h, tcfg["page_hints"])
+            if advice:
+                print(f"Suggestion: {advice}")
+        finally:
+            ledger.close()
+
+    if shutil.which("launchctl"):
+        print("")
+        print(schedule.describe())
+    return 0
+
+
+def cmd_forget(args):
+    _cfg, tcfg = load_config(args.rules)
+    ledger = route.Ledger(tcfg["ledger"])
+    try:
+        site = core.site_of("https://" + args.site) if "://" not in args.site else core.site_of(args.site)
+        n = ledger.forget_site(site)
+    finally:
+        ledger.close()
+    print(f"Forgot {n} decision{'s' if n != 1 else ''} for {site}.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# schedule
+# ---------------------------------------------------------------------------
+
+def cmd_schedule(args):
+    if not shutil.which("launchctl"):
+        warn("Error: launchctl not found. Scheduling needs macOS.")
+        return 1
+    try:
+        if args.action == "install":
+            when = schedule.parse_when(args.daily, args.weekly)
+            python = os.path.realpath(sys.executable)
+            rules = os.path.realpath(args.rules)
+            path = schedule.install(python, SCRIPT, rules, when)
+            print(f"Installed {path}")
+            print(schedule.describe())
+            print("")
+            print("Two one-time steps, because launchd runs python3 directly, not Terminal:")
+            print(f"  1. Give Full Disk Access to:  {python}")
+            print("     (System Settings > Privacy & Security > Full Disk Access, '+', then Cmd-Shift-G to paste the path.)")
+            print("     Needed for Tab Groups and iPhone/iPad tabs.")
+            print("  2. Run `stg2gl-triage schedule run-now` while you are at the Mac and click Allow")
+            print("     on the 'wants to control Safari' prompts.")
+        elif args.action == "remove":
+            print("Removed." if schedule.remove() else "No schedule was installed.")
+        elif args.action == "run-now":
+            schedule.run_now()
+            print(f"Started. Output goes to {schedule.log_path()}")
+        else:
+            print(schedule.describe())
+    except schedule.ScheduleError as e:
+        warn(f"Error: {e}")
+        return 1
     return 0
 
 
@@ -410,23 +596,38 @@ def main(argv=None):
     p.add_argument("--rules", default=default_rules, help="rules JSON (default: config/rules.json or $RULES_FILE)")
     p.add_argument("--file", help="triage file path (default: triage.triage_file in rules)")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sources = ["windows", "tab-groups", "icloud"]
 
-    c = sub.add_parser("collect", help="read tabs and write the triage file")
+    c = sub.add_parser("collect", help="read tabs and add them to the triage file")
     c.add_argument("--dry-run", action="store_true", help="print guesses with reasons; write nothing")
-    c.add_argument("--force", action="store_true", help="overwrite a triage file that has unapplied edits")
+    c.add_argument("--force", action="store_true", help="discard the current triage file and start fresh")
     c.add_argument("--include-seen", action="store_true", help="also show tabs already routed on an earlier run")
-    c.add_argument("--only", nargs="+", choices=["windows", "tab-groups", "icloud"],
-                   default=["windows", "tab-groups", "icloud"], help="limit which sources are read")
-    c.set_defaults(func=cmd_collect)
+    c.add_argument("--only", nargs="+", choices=sources, default=sources, help="limit which sources are read")
+    c.set_defaults(func=cmd_collect, auto=False, notify=False)
 
-    a = sub.add_parser("apply", help="route each section to its destination")
+    au = sub.add_parser("auto", help="collect, send 'auto' rule matches, close them, notify (what the schedule runs)")
+    au.add_argument("--dry-run", action="store_true", help="print what would happen; send and write nothing")
+    au.add_argument("--no-notify", dest="notify", action="store_false", help="skip the notification")
+    au.set_defaults(func=cmd_collect, auto=True, notify=True, force=False, include_seen=False, only=sources)
+
+    a = sub.add_parser("apply", help="route each section, close those tabs, learn from your moves")
     a.add_argument("--dry-run", action="store_true", help="print the routing; write nothing")
     a.add_argument("--force", action="store_true", help="apply a file already marked applied")
     a.add_argument("--throttle", type=int, help="ms between GoodLinks saves (default: throttle_ms)")
     a.set_defaults(func=cmd_apply)
 
-    s = sub.add_parser("status", help="show triage file state and ledger totals")
+    s = sub.add_parser("status", help="triage file, ledger, learned rules, schedule")
     s.set_defaults(func=cmd_status)
+
+    fg = sub.add_parser("forget", help="drop what was learned about one site")
+    fg.add_argument("site", help="e.g. seriouseats.com")
+    fg.set_defaults(func=cmd_forget)
+
+    sc = sub.add_parser("schedule", help="manage the launchd job that runs `auto`")
+    sc.add_argument("action", choices=["install", "remove", "run-now", "show"])
+    sc.add_argument("--daily", metavar="HH:MM", help="install: every day at this time")
+    sc.add_argument("--weekly", metavar="'DAY[,DAY] HH:MM'", help="install: e.g. 'sun 09:00' or 'mon,thu 18:30'")
+    sc.set_defaults(func=cmd_schedule)
 
     args = p.parse_args(argv)
     if not os.path.isfile(args.rules):
