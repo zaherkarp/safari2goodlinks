@@ -48,6 +48,13 @@
     "bookmarks_html_dir": "~/Downloads",
     "bookmark_bare_domains": true,
 
+    "auto_route": true,
+    "close_tabs": true,
+    "close_tabs_keep_domains": [],
+    "learn": { "enabled": true, "min_count": 3, "min_share": 0.8 },
+    "page_hints": "off",
+    "page_hints_max": 150,
+
     "sources": {
       "windows": true,
       "tab_groups": { "method": "db", "names": [], "exclude": [] },
@@ -55,29 +62,29 @@
     },
 
     "category_rules": [
-      { "category": "skip", "why": "login, account or checkout page",
+      { "category": "skip", "why": "login, account or checkout page", "auto": true,
         "url_regex": "/(login|log-in|signin|sign-in|signup|logout|checkout|cart|account|oauth)(/|\\?|$)" },
-      { "category": "skip", "why": "search results",
+      { "category": "skip", "why": "search results", "auto": true,
         "url_regex": "(google\\.[a-z.]+/search|bing\\.com/search|duckduckgo\\.com/\\?q=|kagi\\.com/search)" },
-      { "category": "skip", "why": "web app, not content",
+      { "category": "skip", "why": "web app, not content", "auto": true,
         "domains": ["mail.google.com", "calendar.google.com", "icloud.com", "web.whatsapp.com"] },
 
       { "category": "unsorted", "why": "Google Docs file: decide by hand",
         "domains": ["docs.google.com", "drive.google.com"] },
 
-      { "category": "note", "why": "Q&A answer: keep the fact",
+      { "category": "note", "why": "Q&A answer: keep the fact", "auto": true,
         "domains": ["stackoverflow.com", "stackexchange.com", "superuser.com", "serverfault.com", "askubuntu.com"] },
       { "category": "note", "why": "encyclopedia entry",
         "domains": ["wikipedia.org"] },
       { "category": "note", "why": "recipe",
         "title_regex": "\\brecipes?\\b" },
 
-      { "category": "bookmark", "why": "shop (place, not thing)",
+      { "category": "bookmark", "why": "shop (place, not thing)", "auto": true,
         "domains": ["rei.com", "etsy.com", "jetpens.com", "countycomm.com", "humangear.com", "mightyedc.com"] },
       { "category": "bookmark", "why": "documentation site",
         "domains": ["docs.", "readthedocs.io", "developer.apple.com", "developer.mozilla.org"] },
 
-      { "category": "read", "why": "paper",
+      { "category": "read", "why": "paper", "auto": true,
         "domains": ["arxiv.org", "ssrn.com", "biorxiv.org"] },
       { "category": "read", "why": "newsletter or blog platform",
         "domains": ["substack.com", "medium.com", "ghost.io", "beehiiv.com"] },

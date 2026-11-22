@@ -51,6 +51,19 @@ def url_key(url: str) -> str:
     return base.replace("(", "%28").replace(")", "%29")
 
 
+def site_of(url: str) -> str:
+    """Hostname without port and without a leading "www.".
+
+    This is the unit the triage tool learns from: moving three tabs from
+    www.seriouseats.com to "note" teaches a rule for seriouseats.com.
+    Subdomains stay distinct (foo.substack.com is not bar.substack.com),
+    because one platform domain often hosts very different sites.
+    """
+    host = host_of(url).rsplit("@", 1)[-1]   # drop any user:pass@
+    host = host.split(":", 1)[0]               # drop :port
+    return host[4:] if host.startswith("www.") else host
+
+
 def dedupe_keep_order(items):
     """Drop empty and repeated values while keeping first-seen order."""
     out = []
@@ -193,14 +206,21 @@ class TagRules:
 # GoodLinks output
 # ---------------------------------------------------------------------------
 
+def goodlinks_available() -> bool:
+    """True if GoodLinks.app is installed (asks Launch Services via `open -Ra`)."""
+    try:
+        return subprocess.run(["open", "-Ra", "GoodLinks"], capture_output=True).returncode == 0
+    except FileNotFoundError:  # no `open` command: not macOS
+        return False
+
+
 def check_goodlinks_available():
     """Pre-flight: verify GoodLinks.app is installed and can handle its URL scheme.
 
     Exits the process (status 1) if it is missing, so a long batch never
     starts and then fails on every item.
     """
-    result = subprocess.run(["open", "-Ra", "GoodLinks"], capture_output=True)
-    if result.returncode != 0:
+    if not goodlinks_available():
         print(
             "Error: GoodLinks.app not found. Install it or use --output json/sqlite/markdown.",
             file=sys.stderr,

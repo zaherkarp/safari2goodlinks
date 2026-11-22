@@ -50,14 +50,24 @@ def install_fakes(bin_dir: str, window_tabs, front_tabs=None, open_log=None):
     with open(os.path.join(data_dir, "front.json"), "w") as f:
         f.write(front_json)
 
+    # close_tabs: log each URL key on its own line, print how many.
+    # -e (notify.py's display notification): log the title and message.
     write_exe(os.path.join(bin_dir, "osascript"), textwrap.dedent(f"""\
         #!/bin/sh
         case "$1" in
           *export_all_windows.applescript) cat "{data_dir}/all_windows.txt"; echo ;;
           *export_tabs.applescript) cat "{data_dir}/front.json"; echo ;;
           *select_tab_group.applescript) exit 0 ;;
+          *close_tabs.applescript) shift; for k in "$@"; do echo "$k" >> "{bin_dir}/close.log"; done; echo $# ;;
+          -e) shift 6; echo "$1 | $2" >> "{bin_dir}/notify.log" ;;
           *) echo "fake osascript: unexpected $1" >&2; exit 1 ;;
         esac
+        """))
+    # launchctl: log the call; `print` succeeds so describe() says loaded.
+    write_exe(os.path.join(bin_dir, "launchctl"), textwrap.dedent(f"""\
+        #!/bin/sh
+        echo "$@" >> "{bin_dir}/launchctl.log"
+        exit 0
         """))
     log = open_log or os.path.join(bin_dir, "open.log")
     write_exe(os.path.join(bin_dir, "open"), textwrap.dedent(f"""\
@@ -66,6 +76,12 @@ def install_fakes(bin_dir: str, window_tabs, front_tabs=None, open_log=None):
         exit 0
         """))
     return log
+
+
+def set_window_tabs(bin_dir: str, window_tabs):
+    """Change what the fake Safari reports, between runs of one test."""
+    with open(os.path.join(bin_dir, "_data", "all_windows.txt"), "w") as f:
+        f.write("\n".join(f"{w}\n{t}\n{u}" for w, t, u in window_tabs))
 
 
 def make_cloudtabs_db(path: str, devices):

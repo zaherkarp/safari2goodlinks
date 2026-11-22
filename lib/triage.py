@@ -36,6 +36,13 @@ from stg2gl_core import md_escape_link_text, md_escape_url
 
 SECTIONS = (UNSORTED,) + CATEGORIES  # display order in the file
 
+# Read-only section listing what the scheduled run already sent, so Z can
+# spot a bad "auto" rule. Its lines are not items (no leading "["), and it
+# is cleared on apply because by then Z has seen it.
+SENT_SECTION = "sent automatically"
+SENT_COMMENT = ("<!-- Already sent by the scheduled run; listed so you can check the automatic rules.\n"
+                "     Moving these lines does nothing. Cleared on apply. -->")
+
 STATE_RE = re.compile(r"<!--\s*stg2gl-triage state=(\w+)\s*-->")
 
 # One item line. Link text may contain escaped characters (\[ \] \\), so it
@@ -81,8 +88,17 @@ class Item:
         return line
 
 
-def render(items, generated_at: str, state: str = "pending") -> str:
-    """Render items into the triage file text, grouped by category."""
+def sent_line(it, why: str) -> str:
+    """One line for the "sent automatically" section."""
+    return f"- {it.category}: [{md_escape_link_text(it.title or it.url)}]({md_escape_url(it.url)}) ({why})"
+
+
+def render(items, generated_at: str, state: str = "pending", sent=()) -> str:
+    """Render items into the triage file text, grouped by category.
+
+    sent: ready-made lines (see sent_line) for the "sent automatically"
+    section, which is omitted when empty.
+    """
     by_cat = {s: [] for s in SECTIONS}
     for it in items:
         by_cat.get(it.category, by_cat[UNSORTED]).append(it)
@@ -91,6 +107,8 @@ def render(items, generated_at: str, state: str = "pending") -> str:
         parts.append(f"## {s}")
         parts.extend(it.to_line() for it in by_cat[s])
         parts.append("")
+    if sent:
+        parts += [f"## {SENT_SECTION}", SENT_COMMENT, *sent, ""]
     return "\n".join(parts)
 
 
@@ -107,14 +125,22 @@ def parse_line(line: str, category: str):
 
 
 def parse(text: str):
+    """Parse a triage file. Returns (state, items, warnings); see parse_full."""
+    state, items, warnings, _sent = parse_full(text)
+    return state, items, warnings
+
+
+def parse_full(text: str):
     """Parse a triage file.
 
-    Returns (state, items, warnings). Items before the first known heading,
-    or under a heading that is not a category, are reported in warnings and
-    dropped rather than guessed at.
+    Returns (state, items, warnings, sent). Items before the first known
+    heading, or under a heading that is not a category, are reported in
+    warnings and dropped rather than guessed at. `sent` holds the raw
+    lines of the "sent automatically" section, kept so a later collect
+    can carry them forward until apply clears them.
     """
     state = None
-    items, warnings = [], []
+    items, warnings, sent = [], [], []
     current = None  # None = no section yet; "" = unknown section
     for n, line in enumerate(text.splitlines(), 1):
         if state is None:
@@ -124,9 +150,16 @@ def parse(text: str):
                 continue
         if line.startswith("## "):
             name = line[3:].strip().lower()
+            if name == SENT_SECTION:
+                current = SENT_SECTION
+                continue
             current = name if name in SECTIONS else ""
             if current == "":
                 warnings.append(f"line {n}: unknown section {line[3:].strip()!r}; its items are ignored")
+            continue
+        if current == SENT_SECTION:
+            if line.startswith("- "):
+                sent.append(line)
             continue
         it = parse_line(line, current or UNSORTED)
         if it is None:
@@ -135,4 +168,4 @@ def parse(text: str):
             warnings.append(f"line {n}: item outside a known section, ignored: {it.url}")
             continue
         items.append(it)
-    return state, items, warnings
+    return state, items, warnings, sent

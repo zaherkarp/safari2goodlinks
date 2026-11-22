@@ -37,7 +37,7 @@ class ClassifierTests(unittest.TestCase):
         self.c = Classifier(RULES, warn=lambda m: None)
 
     def cat(self, url, title=""):
-        return self.c.classify(url, title)[0]
+        return self.c.classify(url, title).category
 
     def test_rules_and_fallback(self):
         self.assertEqual(self.cat("https://stackoverflow.com/questions/1/x"), "note")
@@ -62,7 +62,7 @@ class ClassifierTests(unittest.TestCase):
 
     def test_bare_domain_rule_can_be_disabled(self):
         c = Classifier({"bookmark_bare_domains": False}, warn=lambda m: None)
-        self.assertEqual(c.classify("https://example.com/", "")[0], "unsorted")
+        self.assertEqual(c.classify("https://example.com/", "").category, "unsorted")
 
     def test_bad_rules_are_dropped_with_warning(self):
         msgs = []

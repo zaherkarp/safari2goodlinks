@@ -92,11 +92,6 @@ class TriageE2E(unittest.TestCase):
             self.assertIn("`tg/research`", text)
             self.assertIn("Duplicates merged:   1", r.stderr)
 
-            # A second collect must refuse to clobber unapplied edits.
-            r = e.run("collect")
-            self.assertEqual(r.returncode, 1)
-            self.assertIn("not applied yet", r.stderr)
-
             # --- edit: move the unsorted page to "note" with a comment ----
             line = "- [Odd page](https://example.com/some/page) `window`"
             self.assertIn(line, text)
@@ -104,6 +99,16 @@ class TriageE2E(unittest.TestCase):
             text = text.replace("## note\n", "## note\n" + line + " check the table\n")
             with open(e.triage, "w") as f:
                 f.write(text)
+
+            # A second collect before apply keeps the edit and adds only
+            # the new tab.
+            helpers.set_window_tabs(e.bin, WINDOW_TABS + [(3, "New one", "https://new.example/a/b")])
+            r = e.run("collect")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            merged = e.read(e.triage)
+            self.assertIn(line + " check the table", merged)
+            self.assertIn("new.example/a/b", merged)
+            self.assertIn("New tabs:            1", r.stderr)
 
             # --- apply ----------------------------------------------------
             r = e.run("apply")
@@ -131,8 +136,13 @@ class TriageE2E(unittest.TestCase):
             # --- second collect: everything routed is hidden ---------------
             r = e.run("collect")
             self.assertEqual(r.returncode, 0, r.stderr)
+            # 7 routed tabs hidden; the new tab was left unsorted, so it
+            # is carried forward and is the only line left.
             self.assertIn("Already routed:      7", r.stderr)
-            self.assertNotIn("](https://", e.read(e.triage))  # no item lines left
+            self.assertIn("Already in file:     1", r.stderr)
+            left = e.read(e.triage)
+            self.assertEqual(left.count("](https://"), 1)
+            self.assertIn("new.example/a/b", left)
 
             r = e.run("status")
             self.assertIn("total=7", r.stdout)

@@ -2,7 +2,7 @@
 
 Save every tab in a Safari Tab Group — with smart auto-tagging — to [GoodLinks](https://goodlinks.app) or to a **local file** (JSON, SQLite, Markdown) that never touches the cloud.
 
-No AI, no network calls, no dependencies beyond macOS + Python 3 (pre-installed on macOS).
+No AI, no dependencies beyond macOS + Python 3 (pre-installed on macOS). No network calls, except the optional page labels in the triage command.
 
 To sort tabs from every window, every Tab Group and your iPhone/iPad into read-later, notes and bookmarks, see [Triage](#triage-tabs-to-read--note--bookmark).
 
@@ -189,7 +189,7 @@ In `active` mode, `--group` is not required. The script reads whatever tabs are 
 
 ## Triage: tabs to read / note / bookmark
 
-`bin/stg2gl-triage` is for clearing out tabs that have piled up everywhere. It collects them, guesses where each one belongs, lets you correct the guesses in a markdown file, then sends each one to its destination.
+`bin/stg2gl-triage` is for clearing out tabs that have piled up everywhere. It collects them, guesses where each one belongs, lets you correct the guesses in a markdown file, then sends each one to its destination and closes the tab. It can run on a schedule, send the obvious tabs without asking, and learn from the corrections you make.
 
 | Category | Destination |
 |---|---|
@@ -216,9 +216,75 @@ Editing the triage file:
 - Text typed after a line's tags is kept. On `note` lines it goes into the inbox next to the link.
 - Deleting a line drops it for this run. If the tab is still open, it comes back next time. To stop seeing it, put it under `skip`.
 
-`apply` records every URL it routes in a ledger (`~/.stg2gl/ledger.db`), and `collect` hides ledger URLs, so a tab you keep open is only triaged once. Use `--include-seen` to show them anyway. If a destination fails, `apply` leaves those lines in the triage file and exits 2, and running `apply` again retries them. `collect` will not overwrite a triage file whose edits have not been applied yet unless you pass `--force`.
+`apply` records every URL it routes in a ledger (`~/.stg2gl/ledger.db`), and `collect` hides ledger URLs, so a tab you keep open is only triaged once. Use `--include-seen` to show them anyway. If a destination fails, `apply` leaves those lines in the triage file and exits 2, and running `apply` again retries them.
 
-`apply` does not close tabs. Close them yourself once the run is done.
+Running `collect` again before `apply` adds only the new tabs and leaves your edits alone. `collect --force` throws the file away and starts fresh.
+
+`apply` closes the tabs it routed to read, note or bookmark, in open windows on this Mac. It never closes `skip` tabs, because those are things like webmail that you are probably still using. Turn closing off with `"close_tabs": false`, or protect sites with `"close_tabs_keep_domains"`. Tabs on an iPhone or iPad, and tabs in Tab Groups that are not open in a window, cannot be closed from the Mac.
+
+Only one run happens at a time. If the scheduled run starts while you are applying, one of them stops with "Another stg2gl-triage run is in progress". If you have the triage file open in an editor with unsaved changes when the scheduled run writes to it, saving will overwrite the new tabs it added. They are not lost: they come back on the next run.
+
+### Running on a schedule
+
+```bash
+./bin/stg2gl-triage schedule install --weekly "sun 09:00"   # or --daily 18:30, or --weekly "mon,thu 18:30"
+./bin/stg2gl-triage schedule run-now                         # once, while at the Mac, to answer permission prompts
+./bin/stg2gl-triage schedule show
+./bin/stg2gl-triage schedule remove
+```
+
+The schedule runs `stg2gl-triage auto` through launchd, macOS's job scheduler. If the Mac is asleep at that time, the job runs when it wakes. If the Mac is shut down, that run is skipped. Each `auto` run:
+
+1. collects new tabs into the triage file, keeping your edits;
+2. immediately sends tabs matched by rules marked `"auto": true` (see below) and closes them;
+3. lists what it sent under `## sent automatically` at the bottom of the triage file, so you can spot a bad rule. That list is cleared on `apply`;
+4. shows a notification such as "14 tabs to sort, 6 sent automatically, 5 closed".
+
+You still run `apply` yourself after reviewing. If [terminal-notifier](https://github.com/julienXX/terminal-notifier) is installed (`brew install terminal-notifier`), clicking the notification opens the triage file. Without it, the notification still appears but clicking it does nothing useful. Output goes to `~/Library/Logs/stg2gl-triage.log`.
+
+Permissions: launchd starts python3 directly, so the job does not get Terminal's permissions. `schedule install` prints the python3 path to add under Full Disk Access, which Tab Groups and iCloud Tabs need. `schedule run-now` triggers the "wants to control Safari" prompts while you are there to click Allow. **Unverified:** which binary macOS asks about can vary by macOS version. If manual runs work but scheduled runs log permission errors, that is the cause.
+
+Try a run first without sending or writing anything:
+
+```bash
+./bin/stg2gl-triage auto --dry-run
+```
+
+### Learning from your corrections
+
+Each time `apply` routes a tab, the tool records the site, its guess, and where you actually put the tab. Once you have put at least 3 tabs from one site in the same section, and that is at least 80% of your choices for the site, the site becomes a learned rule. Later tabs from it are guessed that way.
+
+- Learned rules only change the guess you review. They never send tabs automatically.
+- Hand-written rules always come first. If you keep overriding one of those, `status` lists it under "Rules you keep overriding" so you can edit it.
+- The rules adjust themselves. If you start moving a site's tabs somewhere else, its share drops below 80% and the learned rule goes away until a new pattern is clear.
+- `stg2gl-triage forget seriouseats.com` deletes what was learned about one site.
+- Tune the thresholds with `"learn": {"min_count": 3, "min_share": 0.8}`, or turn learning off with `"enabled": false`.
+
+### Page labels (off by default)
+
+`status` reports how many recent tabs matched no rule and how often you change the guesses. If either stays high, it suggests turning on page labels:
+
+```json
+"page_hints": "unsorted"
+```
+
+With this on, `collect` downloads each unsorted tab's page and reads the labels sites put in their own HTML for search engines and link previews. Each label is added to the line as a tag:
+
+| Tag | Meaning |
+|---|---|
+| `page:article`, `page:recipe`, `page:product`, `page:video`, `page:software`, `page:event`, `page:book`, `page:course`, `page:qa`, `page:podcast`, `page:pdf` | What the page says it is |
+| `page:feed` | The site publishes an RSS or Atom feed |
+| `read:12min` | Rough reading time, from the paragraph text |
+
+Labels do not move tabs. They are there to make sorting faster. A rule can opt in to using them:
+
+```json
+{ "category": "note", "page": ["recipe"], "why": "recipe page" }
+```
+
+`"all"` labels every new tab, not just unsorted ones. `page_hints_max` (default 150) caps how many pages one run downloads.
+
+This is the only part of the tool that makes network requests. It requests only pages that were already open in Safari, sends no cookies (so logged-in pages are seen logged out), and talks to no other service.
 
 ### Sources
 
@@ -243,20 +309,24 @@ sqlite3 /tmp/stg2gl-spike/CloudTabs.db .schema
 
 ### Category rules
 
-Rules live in the `triage.category_rules` list of `config/rules.json`. Each rule has a `category` and any of `domains`, `url_regex` and `title_regex`. If a rule lists more than one condition, all of them must match. An optional `why` is shown by `collect --dry-run`.
+Rules live in the `triage.category_rules` list of `config/rules.json`. Each rule has a `category` and any of `domains`, `url_regex`, `title_regex` and `page` (page labels, see above). If a rule lists more than one condition, all of them must match. An optional `why` is shown by `collect --dry-run`. `"auto": true` lets the scheduled run send matches without waiting for review.
 
 ```json
+{ "category": "read", "why": "paper", "auto": true, "domains": ["arxiv.org"] }
 { "category": "read", "why": "newsletter", "domains": ["substack.com"] }
 { "category": "note", "title_regex": "\\brecipes?\\b" }
 { "category": "unsorted", "domains": ["docs.google.com"] }
 ```
 
+Mark a rule `auto` only when you would never move its tabs. A wrong auto rule sends things to the wrong place without you seeing them first; the `## sent automatically` list is the only check. The seed rules mark six as auto: login and checkout pages, search results, web apps (all skip), papers (read), Q&A sites (note) and a few shops (bookmark).
+
 Rules are evaluated in this order:
 
 1. `skip` rules.
 2. Site roots such as `https://example.com/` become bookmarks: a place you go back to, not a thing you finish. Set `"bookmark_bare_domains": false` to turn this off.
-3. Every other rule, in file order. The first match wins. An `unsorted` rule placed above a broad rule carves out an exception to it.
-4. Anything still unmatched goes to `unsorted`.
+3. Every other hand-written rule, in file order. The first match wins. An `unsorted` rule placed above a broad rule carves out an exception to it.
+4. Learned rules.
+5. Anything still unmatched goes to `unsorted`.
 
 The seed rules are deliberately small. Add a rule whenever you find yourself moving the same kind of line by hand.
 
@@ -272,6 +342,12 @@ All of these sit under `"triage"` in `rules.json`. Every key is optional.
 | `triage_file` | `~/Documents/stg2gl/triage.md` |
 | `ledger` | `~/.stg2gl/ledger.db` |
 | `bookmarks_html_dir` | `~/Downloads` |
+| `auto_route` | `true`. Lets `auto` send tabs matched by `"auto": true` rules |
+| `close_tabs` | `true` |
+| `close_tabs_keep_domains` | `[]` |
+| `learn` | `{"enabled": true, "min_count": 3, "min_share": 0.8}` |
+| `page_hints` | `"off"`. Or `"unsorted"`, `"all"` |
+| `page_hints_max` | `150` |
 | `sources.windows` | `true` |
 | `sources.tab_groups` | `{"method": "db", "names": [], "exclude": []}` |
 | `sources.icloud` | `{"enabled": true, "exclude_devices": []}`. This Mac is always excluded. |
@@ -282,7 +358,7 @@ All of these sit under `"triage"` in `rules.json`. Every key is optional.
 python3 -m unittest discover -s tests
 ```
 
-The tests replace `osascript` and `open` with fakes, so they run on Linux as well as macOS and never touch Safari or GoodLinks.
+The tests replace `osascript`, `open` and `launchctl` with fakes, and serve test pages from a local web server, so they run on Linux as well as macOS and never touch Safari, GoodLinks or the internet.
 
 ## All parameters
 
@@ -408,11 +484,16 @@ safari-to-goodlinks/
 │   ├── collect.py                      # Windows, Tab Groups, iCloud Tabs readers
 │   ├── classify.py                     # read / note / bookmark / skip guesses
 │   ├── triage.py                       # Triage file render + parse
-│   └── route.py                        # Destinations and the ledger
+│   ├── route.py                        # Destinations and the ledger
+│   ├── learn.py                        # Learned rules and sorting statistics
+│   ├── hints.py                        # Page labels (off by default)
+│   ├── schedule.py                     # launchd job for `auto`
+│   └── notify.py                       # macOS notification
 ├── scripts/
 │   ├── select_tab_group.applescript    # Clicks a Tab Group in Safari's sidebar
 │   ├── export_tabs.applescript         # Reads front window tabs as JSON
 │   ├── export_all_windows.applescript  # Reads every window's tabs (triage)
+│   ├── close_tabs.applescript          # Closes routed tabs (triage)
 │   └── save_to_goodlinks.applescript   # Standalone: save one URL to GoodLinks
 ├── tests/                              # python3 -m unittest discover -s tests
 ├── config/
@@ -511,7 +592,7 @@ The `skip_url_prefixes` and `skip_url_regex` fields in `rules.json` control whic
 
 ### No data leaves your machine (except through GoodLinks)
 
-The tool itself makes no network calls — all processing is local. The only external data flow is through GoodLinks' own iCloud sync, and only when using `--output goodlinks`.
+The tool itself makes no network calls — all processing is local. The only external data flow is through GoodLinks' own iCloud sync, and only when using `--output goodlinks`. The one exception is `stg2gl-triage` with `page_hints` turned on, which downloads the pages of tabs you had open (see [Page labels](#page-labels-off-by-default)).
 
 ### `--dry-run` output contains browsing history
 
