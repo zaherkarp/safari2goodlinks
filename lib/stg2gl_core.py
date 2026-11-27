@@ -51,6 +51,33 @@ def url_key(url: str) -> str:
     return base.replace("(", "%28").replace(")", "%29")
 
 
+def parse_front_tab_lines(text: str):
+    """Parse export_tabs.applescript output (2 lines per tab: title, url).
+
+    The script returns plain text instead of JSON so no shell ever sees a
+    page title (see the comment at the top of that script for the `echo`
+    escape problem this replaced).
+
+    Split on "\\n" only. str.splitlines() would also split on Unicode line
+    separators (U+2028 etc.), which AppleScript does not strip and which a
+    page title can contain, and that would break the pairing.
+
+    An odd line count means the pairing cannot be trusted, so raise instead
+    of guessing: a shifted pairing would save titles as URLs and URLs under
+    the wrong titles.
+    """
+    # osascript ends its output with one newline and $(...) strips trailing
+    # newlines; either way, trailing newlines carry no data (the script
+    # skips tabs with an empty URL, so the last line is never empty).
+    text = text.rstrip("\n")
+    if not text:
+        return []
+    lines = text.split("\n")
+    if len(lines) % 2 != 0:
+        raise ValueError(f"tab export returned {len(lines)} lines, not a multiple of 2")
+    return [{"title": lines[i], "url": lines[i + 1]} for i in range(0, len(lines), 2)]
+
+
 def dedupe_keep_order(items):
     """Drop empty and repeated values while keeping first-seen order."""
     out = []

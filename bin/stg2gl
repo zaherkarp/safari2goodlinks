@@ -153,8 +153,10 @@ if [[ "$MODE" == "select" ]]; then
   sleep 0.5  # give Safari a moment to switch
 fi
 
-# Export tabs JSON to stdout
-TABS_JSON="$(osascript "$REPO_DIR/scripts/export_tabs.applescript")"
+# Export tabs as plain text (title line, URL line per tab). Parsed in the
+# Python below with stg2gl_core.parse_front_tab_lines; no shell ever sees
+# a page title (see scripts/export_tabs.applescript for why).
+TABS_TEXT="$(osascript "$REPO_DIR/scripts/export_tabs.applescript")"
 
 # Safely serialize BASE_TAGS to JSON via python (avoids shell quoting issues)
 BASE_TAGS_JSON="$(python3 -c "import json, sys; print(json.dumps(sys.argv[1:]))" "${BASE_TAGS[@]+"${BASE_TAGS[@]}"}")"
@@ -162,9 +164,9 @@ BASE_TAGS_JSON="$(python3 -c "import json, sys; print(json.dumps(sys.argv[1:]))"
 # Pass data via environment variables scoped ONLY to the python3 process.
 # Using inline assignment (VAR=val command) ensures the variables are NOT
 # exported to any other child process and do not persist after python3 exits.
-# This is important because STG2GL_TABS_JSON contains the user's browsing
+# This is important because STG2GL_TABS_TEXT contains the user's browsing
 # history (all tab URLs and page titles).
-STG2GL_TABS_JSON="$TABS_JSON" \
+STG2GL_TABS_TEXT="$TABS_TEXT" \
 STG2GL_BASE_TAGS_JSON="$BASE_TAGS_JSON" \
 STG2GL_RULES_PATH="$RULES_PATH" \
 STG2GL_DRY_RUN="$DRY_RUN" \
@@ -205,10 +207,6 @@ def record(url, title, status, detail=""):
 max_n = int(max_arg) if max_arg else None
 
 cfg  = json.load(open(rules_path))
-tabs = json.loads(os.environ["STG2GL_TABS_JSON"])
-if not isinstance(tabs, list):
-    print(f"Error: expected tab list from Safari, got {type(tabs).__name__}", file=sys.stderr)
-    sys.exit(1)
 base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
 
 # Skip/tag rules and the GoodLinks backend live in lib/stg2gl_core.py so
@@ -216,6 +214,14 @@ base_tags = json.loads(os.environ["STG2GL_BASE_TAGS_JSON"])
 # signatures the main loop already uses, so nothing else here changed.
 sys.path.insert(0, os.environ["STG2GL_LIB_DIR"])
 import stg2gl_core as core
+
+# Tabs from Safari: two lines per tab. An odd line count means the title/URL
+# pairing cannot be trusted, so stop rather than save mismatched pairs.
+try:
+    tabs = core.parse_front_tab_lines(os.environ["STG2GL_TABS_TEXT"])
+except ValueError as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
 
 rules = core.TagRules(cfg)  # compiles regexes; warns on bad patterns
 

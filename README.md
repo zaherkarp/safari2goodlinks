@@ -15,7 +15,7 @@ Safari Tab Group
 [select_tab_group.applescript]   <- clicks the named group in Safari's sidebar
        |
        v
-[export_tabs.applescript]        <- reads every tab's title + URL as JSON
+[export_tabs.applescript]        <- reads every tab's title + URL as plain text
        |
        v
 [stg2gl tagging engine]         <- applies rules from config/rules.json
@@ -411,7 +411,7 @@ safari-to-goodlinks/
 │   └── route.py                        # Destinations and the ledger
 ├── scripts/
 │   ├── select_tab_group.applescript    # Clicks a Tab Group in Safari's sidebar
-│   ├── export_tabs.applescript         # Reads front window tabs as JSON
+│   ├── export_tabs.applescript         # Reads front window tabs (title, URL lines)
 │   ├── export_all_windows.applescript  # Reads every window's tabs (triage)
 │   └── save_to_goodlinks.applescript   # Standalone: save one URL to GoodLinks
 ├── tests/                              # python3 -m unittest discover -s tests

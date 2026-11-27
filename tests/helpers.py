@@ -38,23 +38,24 @@ def install_fakes(bin_dir: str, window_tabs, front_tabs=None, open_log=None):
     """Create fake osascript/open in bin_dir.
 
     window_tabs: list of (window_index, title, url) for export_all_windows.
-    front_tabs:  list of {"title","url"} for export_tabs (bin/stg2gl).
+    front_tabs:  list of {"title","url"} for export_tabs (bin/stg2gl),
+                 written as the script's two-lines-per-tab text.
     """
     os.makedirs(bin_dir, exist_ok=True)
     all_windows = "\n".join(f"{w}\n{t}\n{u}" for w, t, u in window_tabs)
-    front_json = json.dumps(front_tabs or [])
+    front_text = "\n".join(f"{x['title']}\n{x['url']}" for x in (front_tabs or []))
     data_dir = os.path.join(bin_dir, "_data")
     os.makedirs(data_dir, exist_ok=True)
     with open(os.path.join(data_dir, "all_windows.txt"), "w") as f:
         f.write(all_windows)
-    with open(os.path.join(data_dir, "front.json"), "w") as f:
-        f.write(front_json)
+    with open(os.path.join(data_dir, "front.txt"), "w") as f:
+        f.write(front_text)
 
     write_exe(os.path.join(bin_dir, "osascript"), textwrap.dedent(f"""\
         #!/bin/sh
         case "$1" in
           *export_all_windows.applescript) cat "{data_dir}/all_windows.txt"; echo ;;
-          *export_tabs.applescript) cat "{data_dir}/front.json"; echo ;;
+          *export_tabs.applescript) cat "{data_dir}/front.txt"; echo ;;
           *select_tab_group.applescript) exit 0 ;;
           *) echo "fake osascript: unexpected $1" >&2; exit 1 ;;
         esac

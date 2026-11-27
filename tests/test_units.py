@@ -239,5 +239,29 @@ class ReaderTests(unittest.TestCase):
             collect.from_icloud("/nonexistent/CloudTabs.db")
 
 
+class ParseFrontTabLines(unittest.TestCase):
+    """stg2gl_core.parse_front_tab_lines: two lines per tab, split on LF only."""
+
+    def test_pairs(self):
+        self.assertEqual(core.parse_front_tab_lines("A\nhttps://a\nB\nhttps://b\n"),
+                         [{"title": "A", "url": "https://a"}, {"title": "B", "url": "https://b"}])
+
+    def test_empty(self):
+        self.assertEqual(core.parse_front_tab_lines(""), [])
+        self.assertEqual(core.parse_front_tab_lines("\n"), [])
+
+    def test_empty_title_kept(self):
+        self.assertEqual(core.parse_front_tab_lines("\nhttps://a"), [{"title": "", "url": "https://a"}])
+
+    def test_backslash_sequences_and_unicode_separators_stay_in_the_title(self):
+        title = "x\\ny\\c\u2028z\u0085w"
+        self.assertEqual(core.parse_front_tab_lines(f"{title}\nhttps://a"),
+                         [{"title": title, "url": "https://a"}])
+
+    def test_odd_count_refused(self):
+        with self.assertRaises(ValueError):
+            core.parse_front_tab_lines("A\nhttps://a\nB")
+
+
 if __name__ == "__main__":
     unittest.main()
