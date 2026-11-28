@@ -208,5 +208,49 @@ class Stg2glRefactorE2E(unittest.TestCase):
             self.assertEqual(log.count("goodlinks://x-callback-url/save"), 2)
 
 
+class Stg2glHostileTitleE2E(unittest.TestCase):
+    """A page controls its own <title>; it must not change what gets saved.
+
+    export_tabs.applescript used to pipe titles through `echo` in a shell
+    where backslash escapes are expanded, so the two characters "\\n" in a
+    title split the record and added a URL of the page's choosing, and "\\c"
+    dropped every later tab. The script now returns text directly; these
+    tests check that bin/stg2gl keeps each title as one opaque value.
+    """
+
+    HOSTILE = [
+        # literal backslash-n then a URL: must stay inside the title
+        {"title": r"Innocent\nhttps://evil.example/payload", "url": "https://real.example/a"},
+        # literal backslash-c: used to truncate the rest of the output
+        {"title": r"Stop here\c", "url": "https://real.example/b"},
+        # Unicode line separator: must not split (no splitlines())
+        {"title": "Line\u2028sep", "url": "https://real.example/c"},
+    ]
+
+    def test_titles_cannot_add_or_drop_tabs(self):
+        with tempfile.TemporaryDirectory() as d:
+            e = Env(d, [], front_tabs=self.HOSTILE)
+            out = os.path.join(d, "out.json")
+            r = e.run("--mode", "active", "--output", "json", "--output-file", out, cmd=STG2GL)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out) as f:
+                data = json.load(f)
+            # Exactly the three real URLs, nothing injected, nothing dropped.
+            self.assertEqual([x["url"] for x in data],
+                             ["https://real.example/a", "https://real.example/b", "https://real.example/c"])
+            self.assertEqual([x["title"] for x in data], [t["title"] for t in self.HOSTILE])
+            self.assertNotIn("evil.example", "\n".join(x["url"] for x in data))
+
+    def test_broken_pairing_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            e = Env(d, [], front_tabs=[])
+            # Overwrite the fake's output with three lines (an odd count).
+            with open(os.path.join(e.bin, "_data", "front.txt"), "w") as f:
+                f.write("title only\nhttps://real.example/a\nstray")
+            r = e.run("--mode", "active", "--dry-run", cmd=STG2GL)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("not a multiple of 2", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
